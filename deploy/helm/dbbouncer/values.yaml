@@ -1,0 +1,46 @@
+replicaCount: 2
+
+image:
+  repository: dbbouncer
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  postgresPort: 6432
+  mysqlPort: 3307
+  apiPort: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+config:
+  listen:
+    postgres_port: 6432
+    mysql_port: 3307
+    api_port: 8080
+  defaults:
+    min_connections: 2
+    max_connections: 20
+    idle_timeout: 5m
+    max_lifetime: 30m
+    acquire_timeout: 10s
+  tenants: {}
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  namespace: ""
+
+podAnnotations: {}
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
