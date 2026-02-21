@@ -210,7 +210,7 @@ func TestPGStartupWithTenantInOptions(t *testing.T) {
 		client.Write(startupMsg)
 	}()
 
-	tenantID, _, err := h.readStartupMessage(server)
+	tenantID, _, _, err := h.readStartupMessage(server)
 	if err != nil {
 		t.Fatalf("readStartupMessage error: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestPGStartupWithTenantAsParam(t *testing.T) {
 		client.Write(startupMsg)
 	}()
 
-	tenantID, _, err := h.readStartupMessage(server)
+	tenantID, _, _, err := h.readStartupMessage(server)
 	if err != nil {
 		t.Fatalf("readStartupMessage error: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestPGStartupWithTenantInUsername(t *testing.T) {
 		client.Write(startupMsg)
 	}()
 
-	tenantID, _, err := h.readStartupMessage(server)
+	tenantID, _, _, err := h.readStartupMessage(server)
 	if err != nil {
 		t.Fatalf("readStartupMessage error: %v", err)
 	}
@@ -423,7 +423,7 @@ func TestPGSSLDenied(t *testing.T) {
 		client.Write(startupMsg)
 	}()
 
-	tenantID, _, err := h.readStartupMessage(server)
+	tenantID, _, _, err := h.readStartupMessage(server)
 	if err != nil {
 		t.Fatalf("readStartupMessage error after SSL denial: %v", err)
 	}
@@ -772,5 +772,93 @@ func TestRelayCopiesBidirectionally(t *testing.T) {
 	}
 	if string(buf[:n]) != "hello from client" {
 		t.Errorf("expected 'hello from client', got %q", string(buf[:n]))
+	}
+}
+
+func TestMySQLRandomNonce(t *testing.T) {
+	cfg := testConfig()
+	r := router.New(cfg)
+	pm := pool.NewManager(cfg.Defaults)
+	defer pm.Close()
+
+	h := &MySQLHandler{router: r, poolMgr: pm, healthCheck: nil, metrics: nil}
+
+	// Send two synthetic handshakes and verify auth data differs
+	extractAuthData := func() []byte {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- h.sendSyntheticHandshake(server)
+		}()
+
+		client.SetReadDeadline(time.Now().Add(2 * time.Second))
+		payload, err := readMySQLPacket(client)
+		if err != nil {
+			t.Fatalf("reading handshake: %v", err)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("sendSyntheticHandshake error: %v", err)
+		}
+
+		// Find auth data: skip protocol version (1) + version string (null-terminated) + conn id (4)
+		pos := 1
+		for pos < len(payload) && payload[pos] != 0 {
+			pos++
+		}
+		pos++ // skip null terminator
+		pos += 4 // skip connection id
+
+		// Auth-plugin-data part 1 (8 bytes)
+		authPart1 := make([]byte, 8)
+		copy(authPart1, payload[pos:pos+8])
+		return authPart1
+	}
+
+	auth1 := extractAuthData()
+	auth2 := extractAuthData()
+
+	// The two nonces should be different (random)
+	allSame := true
+	for i := range auth1 {
+		if auth1[i] != auth2[i] {
+			allSame = false
+			break
+		}
+	}
+	if allSame {
+		t.Error("MySQL auth nonce should be random — two handshakes produced identical auth data")
+	}
+}
+
+func TestPGSSLMaxAttempts(t *testing.T) {
+	cfg := testConfig()
+	r := router.New(cfg)
+	pm := pool.NewManager(cfg.Defaults)
+	defer pm.Close()
+
+	h := &PostgresHandler{router: r, poolMgr: pm, healthCheck: nil, metrics: nil}
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	// Send 5 SSL requests (exceeds max of 3)
+	go func() {
+		for i := 0; i < 5; i++ {
+			client.Write(buildPGSSLRequest())
+			resp := make([]byte, 1)
+			_, err := client.Read(resp)
+			if err != nil {
+				return // expected: server closes after max attempts
+			}
+		}
+	}()
+
+	_, _, _, err := h.readStartupMessage(server)
+	if err == nil {
+		t.Fatal("expected error for too many SSL attempts")
 	}
 }

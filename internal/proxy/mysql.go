@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -143,6 +144,18 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 
 // sendSyntheticHandshake sends a minimal MySQL handshake to learn the client's tenant.
 func (h *MySQLHandler) sendSyntheticHandshake(conn net.Conn) error {
+	// Generate random auth challenge (20 bytes: 8 for part1 + 12 for part2)
+	authData := make([]byte, 20)
+	if _, err := rand.Read(authData); err != nil {
+		return fmt.Errorf("generating auth challenge: %w", err)
+	}
+	// Ensure no zero bytes in auth data (MySQL protocol uses null terminators)
+	for i := range authData {
+		if authData[i] == 0 {
+			authData[i] = 1
+		}
+	}
+
 	// Build a MySQL Protocol::Handshake (v10)
 	var buf []byte
 
@@ -158,7 +171,7 @@ func (h *MySQLHandler) sendSyntheticHandshake(conn net.Conn) error {
 	buf = append(buf, 1, 0, 0, 0)
 
 	// Auth-plugin-data part 1 (8 bytes)
-	buf = append(buf, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08)
+	buf = append(buf, authData[:8]...)
 
 	// Filler
 	buf = append(buf, 0)
@@ -184,8 +197,9 @@ func (h *MySQLHandler) sendSyntheticHandshake(conn net.Conn) error {
 	// Reserved (10 bytes of 0)
 	buf = append(buf, make([]byte, 10)...)
 
-	// Auth-plugin-data part 2 (13 bytes, last byte is 0)
-	buf = append(buf, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x00)
+	// Auth-plugin-data part 2 (12 bytes + null terminator)
+	buf = append(buf, authData[8:]...)
+	buf = append(buf, 0x00)
 
 	// Auth plugin name
 	pluginName := "mysql_native_password"

@@ -19,11 +19,15 @@ type Config struct {
 	Tenants  map[string]TenantConfig `yaml:"tenants"`
 }
 
-// ListenConfig defines the ports DBBouncer listens on.
+// ListenConfig defines the ports and bind addresses DBBouncer listens on.
 type ListenConfig struct {
-	PostgresPort int `yaml:"postgres_port"`
-	MySQLPort    int `yaml:"mysql_port"`
-	APIPort      int `yaml:"api_port"`
+	PostgresPort int    `yaml:"postgres_port"`
+	MySQLPort    int    `yaml:"mysql_port"`
+	APIPort      int    `yaml:"api_port"`
+	APIBind      string `yaml:"api_bind"`
+	APIKey       string `yaml:"api_key"`
+	TLSCert      string `yaml:"tls_cert"`
+	TLSKey       string `yaml:"tls_key"`
 }
 
 // PoolDefaults defines default pool settings applied when tenants don't override.
@@ -90,6 +94,20 @@ func (t TenantConfig) EffectiveAcquireTimeout(defaults PoolDefaults) time.Durati
 	return defaults.AcquireTimeout
 }
 
+// Redacted returns a copy of the TenantConfig with the password masked.
+func (t TenantConfig) Redacted() TenantConfig {
+	c := t
+	if c.Password != "" {
+		c.Password = "***REDACTED***"
+	}
+	return c
+}
+
+// TLSEnabled returns true if both TLS cert and key paths are configured.
+func (lc ListenConfig) TLSEnabled() bool {
+	return lc.TLSCert != "" && lc.TLSKey != ""
+}
+
 var envVarPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
 
 // substituteEnvVars replaces ${VAR_NAME} patterns with environment variable values.
@@ -134,6 +152,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Listen.APIPort == 0 {
 		cfg.Listen.APIPort = 8080
+	}
+	if cfg.Listen.APIBind == "" {
+		cfg.Listen.APIBind = "127.0.0.1"
 	}
 	if cfg.Defaults.MinConnections == 0 {
 		cfg.Defaults.MinConnections = 2

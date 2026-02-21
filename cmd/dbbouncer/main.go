@@ -51,7 +51,7 @@ func main() {
 	hc.Start()
 
 	// Start proxy server
-	proxyServer := proxy.NewServer(r, pm, hc, m)
+	proxyServer := proxy.NewServer(r, pm, hc, m, cfg.Listen)
 
 	if err := proxyServer.ListenPostgres(cfg.Listen.PostgresPort); err != nil {
 		log.Fatalf("Failed to start PostgreSQL proxy: %v", err)

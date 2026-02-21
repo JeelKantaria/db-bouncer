@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -18,6 +19,8 @@ import (
 	"github.com/dbbouncer/dbbouncer/internal/pool"
 	"github.com/dbbouncer/dbbouncer/internal/router"
 )
+
+const maxRequestBodySize = 1 << 20 // 1 MB
 
 // Server is the REST API and metrics server.
 type Server struct {
@@ -40,6 +43,34 @@ func NewServer(r *router.Router, pm *pool.Manager, hc *health.Checker, m *metric
 		startTime:   time.Now(),
 		listenCfg:   lc,
 	}
+}
+
+// authMiddleware returns a middleware that checks for a valid API key.
+// Unauthenticated routes (health, ready, metrics) are excluded.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip auth for health/readiness probes and metrics
+		path := r.URL.Path
+		if path == "/health" || path == "/ready" || path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		apiKey := s.listenCfg.APIKey
+		if apiKey == "" {
+			// No API key configured — allow all requests
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		auth := r.Header.Get("Authorization")
+		if auth == "" || !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != apiKey {
+			writeError(w, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Start starts the HTTP API server.
@@ -74,14 +105,24 @@ func (s *Server) Start(port int) error {
 	r.HandleFunc("/", s.dashboardHandler).Methods("GET")
 	r.HandleFunc("/dashboard", s.dashboardHandler).Methods("GET")
 
-	addr := fmt.Sprintf("0.0.0.0:%d", port)
+	// Wrap with auth middleware
+	handler := s.authMiddleware(r)
+
+	bind := s.listenCfg.APIBind
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
+	addr := fmt.Sprintf("%s:%d", bind, port)
 	s.httpServer = &http.Server{
 		Addr:         addr,
-		Handler:      r,
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
 
+	if s.listenCfg.APIKey == "" {
+		log.Printf("[api] WARNING: API key not configured — management endpoints are unauthenticated")
+	}
 	log.Printf("[api] REST API listening on %s", addr)
 
 	go func() {
@@ -128,7 +169,7 @@ func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
 	for id, tc := range tenants {
 		tr := tenantResponse{
 			ID:     id,
-			Config: tc,
+			Config: tc.Redacted(),
 			Paused: s.router.IsPaused(id),
 		}
 		if stats, ok := s.poolMgr.TenantStats(id); ok {
@@ -143,8 +184,9 @@ func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 	var req struct {
-		ID string        `json:"id"`
+		ID string `json:"id"`
 		tenantRequest
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -179,7 +221,7 @@ func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 	s.router.AddTenant(req.ID, tc)
 	log.Printf("[api] tenant %s registered (%s at %s:%d)", req.ID, tc.DBType, tc.Host, tc.Port)
 
-	writeJSON(w, http.StatusCreated, tenantResponse{ID: req.ID, Config: tc})
+	writeJSON(w, http.StatusCreated, tenantResponse{ID: req.ID, Config: tc.Redacted()})
 }
 
 func (s *Server) getTenant(w http.ResponseWriter, r *http.Request) {
@@ -191,7 +233,7 @@ func (s *Server) getTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr := tenantResponse{ID: id, Config: tc, Paused: s.router.IsPaused(id)}
+	tr := tenantResponse{ID: id, Config: tc.Redacted(), Paused: s.router.IsPaused(id)}
 	if stats, ok := s.poolMgr.TenantStats(id); ok {
 		tr.Stats = &stats
 	}
@@ -202,6 +244,7 @@ func (s *Server) getTenant(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) updateTenant(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 	id := mux.Vars(r)["id"]
 
 	var req tenantRequest
@@ -246,7 +289,7 @@ func (s *Server) updateTenant(w http.ResponseWriter, r *http.Request) {
 	s.router.AddTenant(id, existing)
 	log.Printf("[api] tenant %s updated", id)
 
-	writeJSON(w, http.StatusOK, tenantResponse{ID: id, Config: existing})
+	writeJSON(w, http.StatusOK, tenantResponse{ID: id, Config: existing.Redacted()})
 }
 
 func (s *Server) deleteTenant(w http.ResponseWriter, r *http.Request) {

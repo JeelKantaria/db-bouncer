@@ -2,11 +2,13 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
 	"sync"
 
+	"github.com/dbbouncer/dbbouncer/internal/config"
 	"github.com/dbbouncer/dbbouncer/internal/health"
 	"github.com/dbbouncer/dbbouncer/internal/metrics"
 	"github.com/dbbouncer/dbbouncer/internal/pool"
@@ -19,6 +21,7 @@ type Server struct {
 	poolMgr     *pool.Manager
 	healthCheck *health.Checker
 	metrics     *metrics.Collector
+	tlsConfig   *tls.Config
 
 	pgListener    net.Listener
 	mysqlListener net.Listener
@@ -29,9 +32,9 @@ type Server struct {
 }
 
 // NewServer creates a new proxy server.
-func NewServer(r *router.Router, pm *pool.Manager, hc *health.Checker, m *metrics.Collector) *Server {
+func NewServer(r *router.Router, pm *pool.Manager, hc *health.Checker, m *metrics.Collector, lc config.ListenConfig) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{
+	s := &Server{
 		router:      r,
 		poolMgr:     pm,
 		healthCheck: hc,
@@ -39,6 +42,21 @@ func NewServer(r *router.Router, pm *pool.Manager, hc *health.Checker, m *metric
 		ctx:         ctx,
 		cancel:      cancel,
 	}
+
+	if lc.TLSEnabled() {
+		cert, err := tls.LoadX509KeyPair(lc.TLSCert, lc.TLSKey)
+		if err != nil {
+			log.Printf("[proxy] WARNING: failed to load TLS cert/key: %v — TLS disabled", err)
+		} else {
+			s.tlsConfig = &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				MinVersion:   tls.VersionTLS12,
+			}
+			log.Printf("[proxy] TLS enabled (cert: %s)", lc.TLSCert)
+		}
+	}
+
+	return s
 }
 
 // ListenPostgres starts the PostgreSQL proxy listener.
@@ -111,6 +129,7 @@ func (s *Server) handleConnection(clientConn net.Conn, dbType string) {
 			poolMgr:     s.poolMgr,
 			healthCheck: s.healthCheck,
 			metrics:     s.metrics,
+			tlsConfig:   s.tlsConfig,
 		}
 	case "mysql":
 		handler = &MySQLHandler{

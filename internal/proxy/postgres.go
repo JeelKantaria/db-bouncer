@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -41,12 +42,13 @@ type PostgresHandler struct {
 	poolMgr     *pool.Manager
 	healthCheck *health.Checker
 	metrics     *metrics.Collector
+	tlsConfig   *tls.Config
 }
 
 // Handle processes a PostgreSQL client connection.
 func (h *PostgresHandler) Handle(ctx context.Context, clientConn net.Conn) error {
-	// Read the startup message
-	tenantID, startupMsg, err := h.readStartupMessage(clientConn)
+	// Read the startup message (may upgrade to TLS)
+	tenantID, startupMsg, clientConn, err := h.readStartupMessage(clientConn)
 	if err != nil {
 		return fmt.Errorf("reading startup message: %w", err)
 	}
@@ -113,90 +115,108 @@ func (h *PostgresHandler) Handle(ctx context.Context, clientConn net.Conn) error
 }
 
 // readStartupMessage reads the PostgreSQL startup message and extracts the tenant ID.
-func (h *PostgresHandler) readStartupMessage(conn net.Conn) (string, []byte, error) {
-	// Read message length (4 bytes)
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(conn, lenBuf); err != nil {
-		return "", nil, fmt.Errorf("reading startup length: %w", err)
-	}
-	msgLen := int(binary.BigEndian.Uint32(lenBuf))
+// Handles SSL negotiation as a loop (max 3 attempts) to prevent stack overflow.
+func (h *PostgresHandler) readStartupMessage(conn net.Conn) (string, []byte, net.Conn, error) {
+	const maxSSLAttempts = 3
+	currentConn := conn
 
-	if msgLen < 8 || msgLen > 10000 {
-		return "", nil, fmt.Errorf("invalid startup message length: %d", msgLen)
-	}
-
-	// Read rest of message
-	buf := make([]byte, msgLen-4)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return "", nil, fmt.Errorf("reading startup body: %w", err)
-	}
-
-	// Check for SSL request
-	protoVersion := binary.BigEndian.Uint32(buf[:4])
-	if protoVersion == pgSSLRequestCode {
-		// Deny SSL, tell client to retry without SSL
-		conn.Write([]byte{'N'})
-		// Client should retry with a normal startup message
-		return h.readStartupMessage(conn)
-	}
-
-	// Parse parameters (null-terminated key-value pairs after the protocol version)
-	params := make(map[string]string)
-	data := buf[4:] // skip protocol version
-	for len(data) > 1 {
-		// Read key
-		keyEnd := 0
-		for keyEnd < len(data) && data[keyEnd] != 0 {
-			keyEnd++
+	for attempt := 0; attempt <= maxSSLAttempts; attempt++ {
+		// Read message length (4 bytes)
+		lenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(currentConn, lenBuf); err != nil {
+			return "", nil, currentConn, fmt.Errorf("reading startup length: %w", err)
 		}
-		if keyEnd >= len(data) {
-			break
+		msgLen := int(binary.BigEndian.Uint32(lenBuf))
+
+		if msgLen < 8 || msgLen > 10000 {
+			return "", nil, currentConn, fmt.Errorf("invalid startup message length: %d", msgLen)
 		}
-		key := string(data[:keyEnd])
-		data = data[keyEnd+1:]
 
-		// Read value
-		valEnd := 0
-		for valEnd < len(data) && data[valEnd] != 0 {
-			valEnd++
+		// Read rest of message
+		buf := make([]byte, msgLen-4)
+		if _, err := io.ReadFull(currentConn, buf); err != nil {
+			return "", nil, currentConn, fmt.Errorf("reading startup body: %w", err)
 		}
-		if valEnd >= len(data) {
-			break
+
+		// Check for SSL request
+		protoVersion := binary.BigEndian.Uint32(buf[:4])
+		if protoVersion == pgSSLRequestCode {
+			if h.tlsConfig != nil {
+				// Accept SSL — upgrade the connection
+				currentConn.Write([]byte{'S'})
+				tlsConn := tls.Server(currentConn, h.tlsConfig)
+				if err := tlsConn.Handshake(); err != nil {
+					return "", nil, currentConn, fmt.Errorf("TLS handshake failed: %w", err)
+				}
+				currentConn = tlsConn
+			} else {
+				// Deny SSL, tell client to retry without SSL
+				currentConn.Write([]byte{'N'})
+			}
+			// Client should retry with a normal startup message
+			continue
 		}
-		value := string(data[:valEnd])
-		data = data[valEnd+1:]
 
-		params[key] = value
-	}
+		// Parse parameters (null-terminated key-value pairs after the protocol version)
+		params := make(map[string]string)
+		data := buf[4:] // skip protocol version
+		for len(data) > 1 {
+			// Read key
+			keyEnd := 0
+			for keyEnd < len(data) && data[keyEnd] != 0 {
+				keyEnd++
+			}
+			if keyEnd >= len(data) {
+				break
+			}
+			key := string(data[:keyEnd])
+			data = data[keyEnd+1:]
 
-	// Extract tenant ID from options parameter: -c tenant_id=xxx
-	tenantID := ""
-	if options, ok := params["options"]; ok {
-		tenantID = parseTenantFromOptions(options)
-	}
+			// Read value
+			valEnd := 0
+			for valEnd < len(data) && data[valEnd] != 0 {
+				valEnd++
+			}
+			if valEnd >= len(data) {
+				break
+			}
+			value := string(data[:valEnd])
+			data = data[valEnd+1:]
 
-	// Also check if tenant_id was sent as a direct parameter
-	if tenantID == "" {
-		if tid, ok := params["tenant_id"]; ok {
-			tenantID = tid
+			params[key] = value
 		}
-	}
 
-	// Also try to extract from username format: tenant__user
-	if tenantID == "" {
-		if user, ok := params["user"]; ok {
-			if tid, _, ok := router.ExtractTenantFromUsername(user); ok {
+		// Extract tenant ID from options parameter: -c tenant_id=xxx
+		tenantID := ""
+		if options, ok := params["options"]; ok {
+			tenantID = parseTenantFromOptions(options)
+		}
+
+		// Also check if tenant_id was sent as a direct parameter
+		if tenantID == "" {
+			if tid, ok := params["tenant_id"]; ok {
 				tenantID = tid
 			}
 		}
+
+		// Also try to extract from username format: tenant__user
+		if tenantID == "" {
+			if user, ok := params["user"]; ok {
+				if tid, _, ok := router.ExtractTenantFromUsername(user); ok {
+					tenantID = tid
+				}
+			}
+		}
+
+		// Reconstruct the full startup message
+		fullMsg := make([]byte, msgLen)
+		copy(fullMsg[:4], lenBuf)
+		copy(fullMsg[4:], buf)
+
+		return tenantID, fullMsg, currentConn, nil
 	}
 
-	// Reconstruct the full startup message
-	fullMsg := make([]byte, msgLen)
-	copy(fullMsg[:4], lenBuf)
-	copy(fullMsg[4:], buf)
-
-	return tenantID, fullMsg, nil
+	return "", nil, currentConn, fmt.Errorf("too many SSL negotiation attempts")
 }
 
 // parseTenantFromOptions extracts tenant_id from PG options string.

@@ -2,6 +2,10 @@ listen:
   postgres_port: 6432
   mysql_port: 3307
   api_port: 8080
+  api_bind: "127.0.0.1"    # Bind address for API (default: 127.0.0.1)
+  api_key: "${API_KEY}"     # Bearer token for API auth (leave empty to disable)
+  # tls_cert: "/path/to/cert.pem"
+  # tls_key: "/path/to/key.pem"
 
 defaults:
   min_connections: 2
