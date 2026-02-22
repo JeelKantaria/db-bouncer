@@ -65,22 +65,22 @@ func getCounterValue(c prometheus.Counter) float64 {
 	return m.GetCounter().GetValue()
 }
 
-func TestConnectionOpenedClosed(t *testing.T) {
+func TestUpdatePoolStatsAuthority(t *testing.T) {
 	c, _ := newTestCollector(t)
 
-	c.ConnectionOpened("tenant1", "postgres")
-	c.ConnectionOpened("tenant1", "postgres")
-	c.ConnectionOpened("tenant1", "postgres")
+	// UpdatePoolStats is the sole authority for connection gauges.
+	c.UpdatePoolStats("tenant1", "postgres", 3, 5, 8, 1)
 
 	val := getGaugeValue(c.connectionsActive.WithLabelValues("tenant1", "postgres"))
 	if val != 3 {
 		t.Errorf("expected active=3, got %v", val)
 	}
 
-	c.ConnectionClosed("tenant1", "postgres")
+	// A second call replaces (not increments) the value
+	c.UpdatePoolStats("tenant1", "postgres", 2, 4, 6, 0)
 	val = getGaugeValue(c.connectionsActive.WithLabelValues("tenant1", "postgres"))
 	if val != 2 {
-		t.Errorf("expected active=2 after close, got %v", val)
+		t.Errorf("expected active=2 after update, got %v", val)
 	}
 }
 
@@ -166,10 +166,9 @@ func TestRemoveTenant(t *testing.T) {
 	c, reg := newTestCollector(t)
 
 	// Set some metrics for tenant
-	c.ConnectionOpened("tenant1", "postgres")
+	c.UpdatePoolStats("tenant1", "postgres", 1, 2, 3, 0)
 	c.SetTenantHealth("tenant1", true)
 	c.PoolExhausted("tenant1")
-	c.UpdatePoolStats("tenant1", "postgres", 1, 2, 3, 0)
 
 	// Remove tenant
 	c.RemoveTenant("tenant1")
@@ -194,9 +193,8 @@ func TestRemoveTenant(t *testing.T) {
 func TestMultipleTenants(t *testing.T) {
 	c, _ := newTestCollector(t)
 
-	c.ConnectionOpened("t1", "postgres")
-	c.ConnectionOpened("t2", "mysql")
-	c.ConnectionOpened("t2", "mysql")
+	c.UpdatePoolStats("t1", "postgres", 1, 0, 1, 0)
+	c.UpdatePoolStats("t2", "mysql", 2, 1, 3, 0)
 
 	v1 := getGaugeValue(c.connectionsActive.WithLabelValues("t1", "postgres"))
 	v2 := getGaugeValue(c.connectionsActive.WithLabelValues("t2", "mysql"))
@@ -206,5 +204,32 @@ func TestMultipleTenants(t *testing.T) {
 	}
 	if v2 != 2 {
 		t.Errorf("expected t2 active=2, got %v", v2)
+	}
+}
+
+func TestNewDoesNotPanicOnMultipleCalls(t *testing.T) {
+	// Calling New() multiple times should not panic because each creates
+	// its own registry instead of using the global default.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("New() panicked on repeated calls: %v", r)
+		}
+	}()
+
+	c1 := New()
+	c2 := New()
+
+	// Both should work independently
+	c1.UpdatePoolStats("t1", "postgres", 1, 0, 1, 0)
+	c2.UpdatePoolStats("t1", "postgres", 2, 0, 2, 0)
+
+	v1 := getGaugeValue(c1.connectionsActive.WithLabelValues("t1", "postgres"))
+	v2 := getGaugeValue(c2.connectionsActive.WithLabelValues("t1", "postgres"))
+
+	if v1 != 1 {
+		t.Errorf("c1 expected active=1, got %v", v1)
+	}
+	if v2 != 2 {
+		t.Errorf("c2 expected active=2, got %v", v2)
 	}
 }

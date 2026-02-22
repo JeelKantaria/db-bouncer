@@ -81,7 +81,7 @@ func (h *PostgresHandler) Handle(ctx context.Context, clientConn net.Conn) error
 
 	// Get a pooled connection
 	tenantPool := h.poolMgr.GetOrCreate(tenantID, tc)
-	pc, err := tenantPool.Acquire()
+	pc, err := tenantPool.Acquire(ctx)
 	if err != nil {
 		h.sendPGError(clientConn, "FATAL", "08000", fmt.Sprintf("cannot connect to database: %s", err))
 		return err
@@ -91,11 +91,6 @@ func (h *PostgresHandler) Handle(ctx context.Context, clientConn net.Conn) error
 	defer pc.Close()
 
 	backendConn := pc.Conn()
-
-	if h.metrics != nil {
-		h.metrics.ConnectionOpened(tenantID, "postgres")
-		defer h.metrics.ConnectionClosed(tenantID, "postgres")
-	}
 
 	// Forward the startup message to the backend
 	if _, err := backendConn.Write(startupMsg); err != nil {

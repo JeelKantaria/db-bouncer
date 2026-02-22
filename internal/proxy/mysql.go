@@ -96,7 +96,7 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 
 	// Get a pooled raw TCP connection to the backend
 	tenantPool := h.poolMgr.GetOrCreate(tenantID, tc)
-	pc, err := tenantPool.Acquire()
+	pc, err := tenantPool.Acquire(ctx)
 	if err != nil {
 		h.sendMySQLError(clientConn, 1045, "08S01", fmt.Sprintf("cannot connect to database: %s", err), errSeq)
 		return err
@@ -106,11 +106,6 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 	defer pc.Close()
 
 	backendConn := pc.Conn()
-
-	if h.metrics != nil {
-		h.metrics.ConnectionOpened(tenantID, "mysql")
-		defer h.metrics.ConnectionClosed(tenantID, "mysql")
-	}
 
 	// Read the real server's handshake
 	_, _, err = readMySQLPacket(backendConn)

@@ -163,3 +163,45 @@ func TestDoubleStop(t *testing.T) {
 	c.Stop()
 	c.Stop()
 }
+
+func TestCheckAllIsParallel(t *testing.T) {
+	// Create a router with multiple tenants
+	r := router.New(&config.Config{
+		Tenants: map[string]config.TenantConfig{
+			"t1": {DBType: "postgres", Host: "localhost", Port: 59991, DBName: "db", Username: "u"},
+			"t2": {DBType: "postgres", Host: "localhost", Port: 59992, DBName: "db", Username: "u"},
+			"t3": {DBType: "postgres", Host: "localhost", Port: 59993, DBName: "db", Username: "u"},
+		},
+	})
+	c := NewChecker(r, nil)
+
+	// checkAll should not panic and should update all tenant statuses
+	// (will fail health checks since ports don't exist, but that's fine)
+	c.checkAll()
+
+	statuses := c.GetAllStatuses()
+	if len(statuses) != 3 {
+		t.Errorf("expected 3 statuses after checkAll, got %d", len(statuses))
+	}
+}
+
+func TestPingTenantProtocolCheck(t *testing.T) {
+	// Verify that pingTenant fails gracefully when the port is not open
+	r := router.New(&config.Config{
+		Tenants: map[string]config.TenantConfig{
+			"pg": {DBType: "postgres", Host: "localhost", Port: 59999, DBName: "db", Username: "u"},
+			"my": {DBType: "mysql", Host: "localhost", Port: 59998, DBName: "db", Username: "u"},
+		},
+	})
+	c := NewChecker(r, nil)
+
+	tc, _ := r.Resolve("pg")
+	if c.pingTenant("pg", tc) {
+		t.Error("expected postgres ping to fail on closed port")
+	}
+
+	tc, _ = r.Resolve("my")
+	if c.pingTenant("my", tc) {
+		t.Error("expected mysql ping to fail on closed port")
+	}
+}

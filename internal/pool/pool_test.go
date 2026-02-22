@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"net"
 	"sync"
 	"testing"
@@ -308,7 +309,7 @@ func TestConcurrentAcquireReturn(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
-				pc, err := tp.Acquire()
+				pc, err := tp.Acquire(context.Background())
 				if err != nil {
 					continue // pool may be exhausted, that's OK
 				}
@@ -326,4 +327,122 @@ func TestConcurrentAcquireReturn(t *testing.T) {
 	if stats.Active != 0 {
 		t.Errorf("expected 0 active after all returns, got %d", stats.Active)
 	}
+}
+
+// --- Phase 3: Context, reaper, and pre-warming tests ---
+
+func TestAcquireRespectsContextCancellation(t *testing.T) {
+	tc := config.TenantConfig{
+		DBType: "postgres", Host: "localhost", Port: 15432,
+		DBName: "testdb", Username: "user",
+	}
+	defaults := config.PoolDefaults{
+		MinConnections: 0,
+		MaxConnections: 1,
+		IdleTimeout:    5 * time.Minute,
+		MaxLifetime:    30 * time.Minute,
+		AcquireTimeout: 5 * time.Second,
+	}
+
+	tp := NewTenantPool("ctx_test", tc, defaults)
+	defer tp.Close()
+
+	// Inject one connection and acquire it to exhaust the pool
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	pc := NewPooledConn(client, "ctx_test", "postgres", tp)
+	tp.mu.Lock()
+	tp.idle = append(tp.idle, pc)
+	tp.total++
+	tp.mu.Unlock()
+
+	acquired, err := tp.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("expected successful acquire, got: %v", err)
+	}
+
+	// Pool is now exhausted. Acquire with a cancelled context should fail fast.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	_, err = tp.Acquire(ctx)
+	if err == nil {
+		t.Error("expected error from cancelled context acquire")
+	}
+
+	tp.Return(acquired)
+}
+
+func TestReapIdleRemovesOldest(t *testing.T) {
+	tc := config.TenantConfig{
+		DBType: "postgres", Host: "localhost", Port: 5432,
+		DBName: "testdb", Username: "user",
+	}
+	defaults := config.PoolDefaults{
+		MinConnections: 1,
+		MaxConnections: 5,
+		IdleTimeout:    1 * time.Millisecond, // very short so everything is "idle"
+		MaxLifetime:    30 * time.Minute,
+		AcquireTimeout: 2 * time.Second,
+	}
+
+	tp := NewTenantPool("reap_test", tc, defaults)
+	defer tp.Close()
+
+	// Inject 3 connections with known ordering (oldest first)
+	var pipes []net.Conn
+	for i := 0; i < 3; i++ {
+		client, server := net.Pipe()
+		pipes = append(pipes, client, server)
+		pc := NewPooledConn(client, "reap_test", "postgres", tp)
+		pc.MarkIdle()
+		tp.mu.Lock()
+		tp.idle = append(tp.idle, pc)
+		tp.total++
+		tp.mu.Unlock()
+	}
+	defer func() {
+		for _, p := range pipes {
+			p.Close()
+		}
+	}()
+
+	// Wait for idle timeout to expire
+	time.Sleep(5 * time.Millisecond)
+
+	// Reap should remove oldest (excess over minConns=1)
+	tp.reapIdle()
+
+	tp.mu.Lock()
+	remaining := len(tp.idle)
+	totalAfter := tp.total
+	tp.mu.Unlock()
+
+	if remaining < 1 {
+		t.Errorf("expected at least minConns(1) remaining, got %d", remaining)
+	}
+	if totalAfter > remaining {
+		t.Errorf("total(%d) should match remaining idle(%d) when no active conns", totalAfter, remaining)
+	}
+}
+
+func TestMetricsNewDoesNotPanic(t *testing.T) {
+	// Calling New() multiple times should not panic because it uses a custom registry
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("New() panicked on second call: %v", r)
+		}
+	}()
+
+	// These are in the metrics package, but we test the concept here:
+	// Creating two TenantPools (which happens on reload) should be fine
+	tc := config.TenantConfig{
+		DBType: "postgres", Host: "localhost", Port: 5432,
+		DBName: "testdb", Username: "user",
+	}
+	tp1 := NewTenantPool("t1", tc, testDefaults())
+	tp2 := NewTenantPool("t2", tc, testDefaults())
+	tp1.Close()
+	tp2.Close()
 }

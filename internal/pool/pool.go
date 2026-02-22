@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -78,15 +79,67 @@ func NewTenantPool(tenantID string, tc config.TenantConfig, defaults config.Pool
 	// Start idle reaper
 	go tp.reapLoop()
 
+	// Pre-warm connections in background
+	if tp.minConns > 0 {
+		go tp.warmUp()
+	}
+
 	return tp
 }
 
+// warmUp pre-creates minConns idle connections so the pool is ready for traffic.
+func (tp *TenantPool) warmUp() {
+	for i := 0; i < tp.minConns; i++ {
+		tp.mu.Lock()
+		if tp.closed || tp.total >= tp.minConns {
+			tp.mu.Unlock()
+			return
+		}
+		tp.total++
+		tp.mu.Unlock()
+
+		pc, err := tp.dial(context.Background())
+		if err != nil {
+			tp.mu.Lock()
+			tp.total--
+			tp.mu.Unlock()
+			log.Printf("[pool] warm-up connection %d/%d failed for tenant %s: %v", i+1, tp.minConns, tp.tenantID, err)
+			return
+		}
+
+		tp.mu.Lock()
+		if tp.closed {
+			tp.mu.Unlock()
+			pc.Close()
+			return
+		}
+		pc.MarkIdle()
+		tp.idle = append(tp.idle, pc)
+		tp.mu.Unlock()
+	}
+	log.Printf("[pool] pre-warmed %d connections for tenant %s", tp.minConns, tp.tenantID)
+}
+
 // Acquire gets a connection from the pool, creating one if needed.
-func (tp *TenantPool) Acquire() (*PooledConn, error) {
+// The context is used for cancellation and deadline propagation.
+func (tp *TenantPool) Acquire(ctx context.Context) (*PooledConn, error) {
 	deadlineAt := time.Now().Add(tp.acquireTimeout)
+
+	// If the context has an earlier deadline, use that instead.
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadlineAt) {
+		deadlineAt = ctxDeadline
+	}
 
 	tp.mu.Lock()
 	for {
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			tp.mu.Unlock()
+			return nil, ctx.Err()
+		default:
+		}
+
 		if tp.closed {
 			tp.mu.Unlock()
 			return nil, fmt.Errorf("pool closed for tenant %s", tp.tenantID)
@@ -122,7 +175,7 @@ func (tp *TenantPool) Acquire() (*PooledConn, error) {
 			tp.total++
 			tp.mu.Unlock()
 
-			pc, err := tp.dial()
+			pc, err := tp.dial(ctx)
 			if err != nil {
 				tp.mu.Lock()
 				tp.total--
@@ -278,9 +331,10 @@ func (tp *TenantPool) Close() {
 	tp.Drain()
 }
 
-func (tp *TenantPool) dial() (*PooledConn, error) {
+func (tp *TenantPool) dial(ctx context.Context) (*PooledConn, error) {
 	addr := net.JoinHostPort(tp.host, fmt.Sprintf("%d", tp.port))
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -309,13 +363,12 @@ func (tp *TenantPool) reapIdle() {
 		return
 	}
 
+	// Reap oldest connections first (front of the slice).
+	// Keep at least minConns, preserving the newest (back of the slice).
 	kept := make([]*PooledConn, 0, len(tp.idle))
-	for _, pc := range tp.idle {
-		if len(kept) < tp.minConns {
-			kept = append(kept, pc)
-			continue
-		}
-		if pc.IsIdle(tp.idleTimeout) || pc.IsExpired(tp.maxLifetime) {
+	excess := len(tp.idle) - tp.minConns
+	for i, pc := range tp.idle {
+		if i < excess && (pc.IsIdle(tp.idleTimeout) || pc.IsExpired(tp.maxLifetime)) {
 			pc.Close()
 			tp.total--
 		} else {

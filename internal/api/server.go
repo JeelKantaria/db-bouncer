@@ -99,7 +99,11 @@ func (s *Server) Start(port int) error {
 	r.HandleFunc("/ready", s.readyHandler).Methods("GET")
 
 	// Prometheus metrics
-	r.Handle("/metrics", promhttp.Handler())
+	if s.metrics != nil && s.metrics.Registry != nil {
+		r.Handle("/metrics", promhttp.HandlerFor(s.metrics.Registry, promhttp.HandlerOpts{}))
+	} else {
+		r.Handle("/metrics", promhttp.Handler())
+	}
 
 	// Admin dashboard (must be registered last — catch-all for "/" and "/dashboard")
 	r.HandleFunc("/", s.dashboardHandler).Methods("GET")

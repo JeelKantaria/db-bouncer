@@ -8,6 +8,7 @@ import (
 
 // Collector holds all Prometheus metrics for DBBouncer.
 type Collector struct {
+	Registry           *prometheus.Registry
 	connectionsActive  *prometheus.GaugeVec
 	connectionsIdle    *prometheus.GaugeVec
 	connectionsTotal   *prometheus.GaugeVec
@@ -17,9 +18,14 @@ type Collector struct {
 	poolExhausted      *prometheus.CounterVec
 }
 
-// New creates and registers all Prometheus metrics.
+// New creates and registers all Prometheus metrics using a custom registry.
+// Safe to call multiple times (e.g., in tests or on config reload) — each call
+// creates an independent registry that doesn't conflict with others.
 func New() *Collector {
+	reg := prometheus.NewRegistry()
+
 	c := &Collector{
+		Registry: reg,
 		connectionsActive: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "dbbouncer_connections_active",
@@ -72,7 +78,7 @@ func New() *Collector {
 		),
 	}
 
-	prometheus.MustRegister(
+	reg.MustRegister(
 		c.connectionsActive,
 		c.connectionsIdle,
 		c.connectionsTotal,
@@ -83,16 +89,6 @@ func New() *Collector {
 	)
 
 	return c
-}
-
-// ConnectionOpened increments the active connection gauge.
-func (c *Collector) ConnectionOpened(tenant, dbType string) {
-	c.connectionsActive.WithLabelValues(tenant, dbType).Inc()
-}
-
-// ConnectionClosed decrements the active connection gauge.
-func (c *Collector) ConnectionClosed(tenant, dbType string) {
-	c.connectionsActive.WithLabelValues(tenant, dbType).Dec()
 }
 
 // QueryDuration observes a session duration.
