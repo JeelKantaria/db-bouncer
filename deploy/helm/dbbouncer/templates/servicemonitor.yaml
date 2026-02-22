@@ -2,16 +2,16 @@
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ .Release.Name }}
+  name: {{ include "dbbouncer.fullname" . }}
   labels:
-    app: {{ .Release.Name }}
+    {{- include "dbbouncer.labels" . | nindent 4 }}
   {{- if .Values.serviceMonitor.namespace }}
   namespace: {{ .Values.serviceMonitor.namespace }}
   {{- end }}
 spec:
   selector:
     matchLabels:
-      app: {{ .Release.Name }}
+      {{- include "dbbouncer.selectorLabels" . | nindent 6 }}
   endpoints:
     - port: api
       path: /metrics

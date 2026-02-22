@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"strings"
 	"time"
@@ -36,6 +36,9 @@ const (
 	pgMsgBackendKeyData  byte = 'K'
 )
 
+// Compile-time interface assertion.
+var _ ConnectionHandler = (*PostgresHandler)(nil)
+
 // PostgresHandler handles PostgreSQL wire protocol connections.
 type PostgresHandler struct {
 	router      *router.Router
@@ -58,24 +61,24 @@ func (h *PostgresHandler) Handle(ctx context.Context, clientConn net.Conn) error
 		return fmt.Errorf("no tenant_id in startup message")
 	}
 
-	log.Printf("[postgres] connection from tenant %s", tenantID)
+	slog.Info("connection from tenant", "protocol", "postgres", "tenant", tenantID)
 
 	// Resolve tenant config
 	tc, err := h.router.Resolve(tenantID)
 	if err != nil {
-		h.sendPGError(clientConn, "FATAL", "08000", fmt.Sprintf("unknown tenant: %s", tenantID))
+		h.sendPGError(clientConn, "FATAL", "08000", "connection refused")
 		return err
 	}
 
 	// Check if tenant is paused
 	if h.router.IsPaused(tenantID) {
-		h.sendPGError(clientConn, "FATAL", "08000", fmt.Sprintf("tenant %s is paused", tenantID))
+		h.sendPGError(clientConn, "FATAL", "08000", "connection refused")
 		return fmt.Errorf("tenant %s is paused", tenantID)
 	}
 
 	// Check health
 	if h.healthCheck != nil && !h.healthCheck.IsHealthy(tenantID) {
-		h.sendPGError(clientConn, "FATAL", "08000", fmt.Sprintf("tenant %s database is unhealthy", tenantID))
+		h.sendPGError(clientConn, "FATAL", "08000", "connection refused")
 		return fmt.Errorf("tenant %s is unhealthy", tenantID)
 	}
 
@@ -83,7 +86,7 @@ func (h *PostgresHandler) Handle(ctx context.Context, clientConn net.Conn) error
 	tenantPool := h.poolMgr.GetOrCreate(tenantID, tc)
 	pc, err := tenantPool.Acquire(ctx)
 	if err != nil {
-		h.sendPGError(clientConn, "FATAL", "08000", fmt.Sprintf("cannot connect to database: %s", err))
+		h.sendPGError(clientConn, "FATAL", "08000", "cannot connect to database")
 		return err
 	}
 	// Always close the backend connection after relay — the protocol state

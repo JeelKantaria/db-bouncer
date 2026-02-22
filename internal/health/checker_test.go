@@ -205,3 +205,34 @@ func TestPingTenantProtocolCheck(t *testing.T) {
 		t.Error("expected mysql ping to fail on closed port")
 	}
 }
+
+// --- Phase 4: RemoveTenant test ---
+
+func TestRemoveTenant(t *testing.T) {
+	c := NewChecker(newTestRouter(), nil)
+
+	// Add some health state
+	c.updateStatus("tenant_a", true)
+	c.updateStatus("tenant_b", true)
+
+	if len(c.GetAllStatuses()) != 2 {
+		t.Fatalf("expected 2 statuses before removal")
+	}
+
+	// Remove one tenant
+	c.RemoveTenant("tenant_a")
+
+	statuses := c.GetAllStatuses()
+	if len(statuses) != 1 {
+		t.Errorf("expected 1 status after removal, got %d", len(statuses))
+	}
+	if _, exists := statuses["tenant_a"]; exists {
+		t.Error("tenant_a should have been removed")
+	}
+	if _, exists := statuses["tenant_b"]; !exists {
+		t.Error("tenant_b should still exist")
+	}
+
+	// Remove nonexistent tenant should not panic
+	c.RemoveTenant("nonexistent")
+}

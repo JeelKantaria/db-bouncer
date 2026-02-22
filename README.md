@@ -22,6 +22,8 @@ DBBouncer reduces this to a shared, managed pool per tenant.
 - **Prometheus metrics** - Active/idle/waiting connections, query duration, tenant health
 - **Hot-reload config** - File watcher reloads configuration without restart
 - **Kubernetes-native** - Helm chart, readiness/liveness probes, ServiceMonitor
+- **Secure by Default** - Non-root container, TLS backend support, and authenticated management API
+- **Production Grade** - Race-free concurrency, structured logging (`log/slog`), and graceful degradation during connection spikes
 
 ## Quick Start
 
@@ -119,7 +121,15 @@ Prometheus metrics exposed at `/metrics`:
 | `dbbouncer_tenant_health` | tenant | Health status (1=healthy, 0=unhealthy) |
 | `dbbouncer_pool_exhausted_total` | tenant | Pool exhaustion events |
 
+## Security
+
+- **API Authentication:** Secure the REST API by setting `api_key` in the configuration. The API expects a `Bearer` token.
+- **TLS Support:** Enable end-to-end TLS for backend proxying by providing `tls_cert` and `tls_key` in the configuration.
+- **Hardened Container:** Runs as a non-root user (`dbbouncer`) in a minimal Alpine image.
+
 ## Kubernetes Deployment
+
+DBBouncer is designed to run natively in Kubernetes.
 
 ### Docker
 
@@ -128,6 +138,12 @@ make docker-build
 ```
 
 ### Helm
+
+The included Helm chart (`deploy/helm/dbbouncer`) provides:
+- **Deployment** & **Service**
+- **ConfigMap** with hot-reloading (no pod restarts required for config changes)
+- **PodDisruptionBudget (PDB)** for high availability during node drains
+- **ServiceMonitor** for automatic Prometheus scraping
 
 ```bash
 helm install dbbouncer deploy/helm/dbbouncer \

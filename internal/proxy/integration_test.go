@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -75,7 +76,7 @@ func buildPGStartupMessage(params map[string]string) []byte {
 // buildPGSSLRequest builds a PostgreSQL SSL request message.
 func buildPGSSLRequest() []byte {
 	msg := make([]byte, 8)
-	binary.BigEndian.PutUint32(msg[0:4], 8)                   // length
+	binary.BigEndian.PutUint32(msg[0:4], 8)                        // length
 	binary.BigEndian.PutUint32(msg[4:8], uint32(pgSSLRequestCode)) // SSL request code
 	return msg
 }
@@ -387,7 +388,7 @@ func TestPGStartupPausedTenant(t *testing.T) {
 	<-errCh
 	if clientErr == "" {
 		t.Log("warning: could not read error from client side (pipe may have closed)")
-	} else if clientErr != "tenant tenant_1 is paused" {
+	} else if clientErr != "connection refused" {
 		t.Errorf("client got wrong error: %q", clientErr)
 	}
 }
@@ -411,13 +412,16 @@ func TestPGSSLDenied(t *testing.T) {
 		"tenant_id": "tenant_1",
 	})
 
+	sslErrCh := make(chan string, 1)
 	go func() {
 		client.Write(sslReq)
 		// Read the 'N' (SSL denied) response
 		resp := make([]byte, 1)
 		client.Read(resp)
 		if resp[0] != 'N' {
-			t.Errorf("expected SSL denial 'N', got %c", resp[0])
+			sslErrCh <- fmt.Sprintf("expected SSL denial 'N', got %c", resp[0])
+		} else {
+			sslErrCh <- ""
 		}
 		// Send normal startup
 		client.Write(startupMsg)
@@ -429,6 +433,9 @@ func TestPGSSLDenied(t *testing.T) {
 	}
 	if tenantID != "tenant_1" {
 		t.Errorf("expected tenant_1, got %q", tenantID)
+	}
+	if sslErr := <-sslErrCh; sslErr != "" {
+		t.Error(sslErr)
 	}
 }
 
@@ -606,7 +613,7 @@ func TestMySQLPausedTenant(t *testing.T) {
 	}
 
 	<-errCh
-	if clientErr != "" && clientErr != "tenant tenant_2 is paused" {
+	if clientErr != "" && clientErr != "Access denied" {
 		t.Errorf("client got wrong error: %q", clientErr)
 	}
 }
@@ -808,7 +815,7 @@ func TestMySQLRandomNonce(t *testing.T) {
 		for pos < len(payload) && payload[pos] != 0 {
 			pos++
 		}
-		pos++ // skip null terminator
+		pos++    // skip null terminator
 		pos += 4 // skip connection id
 
 		// Auth-plugin-data part 1 (8 bytes)

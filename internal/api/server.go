@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -31,6 +32,7 @@ type Server struct {
 	httpServer  *http.Server
 	startTime   time.Time
 	listenCfg   config.ListenConfig
+	tenantMu    sync.Mutex // protects read-modify-write in updateTenant
 }
 
 // NewServer creates a new API server.
@@ -109,8 +111,8 @@ func (s *Server) Start(port int) error {
 	r.HandleFunc("/", s.dashboardHandler).Methods("GET")
 	r.HandleFunc("/dashboard", s.dashboardHandler).Methods("GET")
 
-	// Wrap with auth middleware
-	handler := s.authMiddleware(r)
+	// Wrap with security headers, then auth middleware
+	handler := s.securityHeaders(s.authMiddleware(r))
 
 	bind := s.listenCfg.APIBind
 	if bind == "" {
@@ -125,13 +127,13 @@ func (s *Server) Start(port int) error {
 	}
 
 	if s.listenCfg.APIKey == "" {
-		log.Printf("[api] WARNING: API key not configured — management endpoints are unauthenticated")
+		slog.Warn("API key not configured — management endpoints are unauthenticated")
 	}
-	log.Printf("[api] REST API listening on %s", addr)
+	slog.Info("REST API listening", "addr", addr)
 
 	go func() {
 		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("[api] server error: %v", err)
+			slog.Error("API server error", "err", err)
 		}
 	}()
 
@@ -159,11 +161,11 @@ type tenantRequest struct {
 }
 
 type tenantResponse struct {
-	ID     string              `json:"id"`
-	Config config.TenantConfig `json:"config"`
-	Stats  *pool.Stats         `json:"stats,omitempty"`
+	ID     string               `json:"id"`
+	Config config.TenantConfig  `json:"config"`
+	Stats  *pool.Stats          `json:"stats,omitempty"`
 	Health *health.TenantHealth `json:"health,omitempty"`
-	Paused bool                `json:"paused"`
+	Paused bool                 `json:"paused"`
 }
 
 func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
@@ -223,7 +225,7 @@ func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.router.AddTenant(req.ID, tc)
-	log.Printf("[api] tenant %s registered (%s at %s:%d)", req.ID, tc.DBType, tc.Host, tc.Port)
+	slog.Info("tenant registered", "tenant", req.ID, "db_type", tc.DBType, "host", tc.Host, "port", tc.Port)
 
 	writeJSON(w, http.StatusCreated, tenantResponse{ID: req.ID, Config: tc.Redacted()})
 }
@@ -256,6 +258,10 @@ func (s *Server) updateTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
+
+	// Hold lock for the entire read-modify-write to prevent TOCTOU races
+	s.tenantMu.Lock()
+	defer s.tenantMu.Unlock()
 
 	// Verify tenant exists
 	existing, err := s.router.Resolve(id)
@@ -291,7 +297,7 @@ func (s *Server) updateTenant(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.router.AddTenant(id, existing)
-	log.Printf("[api] tenant %s updated", id)
+	slog.Info("tenant updated", "tenant", id)
 
 	writeJSON(w, http.StatusOK, tenantResponse{ID: id, Config: existing.Redacted()})
 }
@@ -306,11 +312,14 @@ func (s *Server) deleteTenant(w http.ResponseWriter, r *http.Request) {
 
 	// Drain and remove pool
 	s.poolMgr.Remove(id)
+	if s.healthCheck != nil {
+		s.healthCheck.RemoveTenant(id)
+	}
 	if s.metrics != nil {
 		s.metrics.RemoveTenant(id)
 	}
 
-	log.Printf("[api] tenant %s removed", id)
+	slog.Info("tenant removed", "tenant", id)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "tenant": id})
 }
 
@@ -338,7 +347,7 @@ func (s *Server) drainTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[api] tenant %s drained", id)
+	slog.Info("tenant drained", "tenant", id)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "drained", "tenant": id})
 }
 
@@ -431,7 +440,7 @@ func (s *Server) pauseTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[api] tenant %s paused", id)
+	slog.Info("tenant paused", "tenant", id)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "paused", "tenant": id})
 }
 
@@ -443,8 +452,19 @@ func (s *Server) resumeTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[api] tenant %s resumed", id)
+	slog.Info("tenant resumed", "tenant", id)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "resumed", "tenant": id})
+}
+
+// securityHeaders adds security-related HTTP headers to all responses.
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // --- Helpers ---

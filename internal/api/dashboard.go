@@ -1,6 +1,12 @@
 package api
 
-import "net/http"
+import (
+	_ "embed"
+	"net/http"
+)
+
+//go:embed dashboard.html
+var dashboardHTML string
 
 // dashboardHandler serves the embedded admin dashboard SPA.
 func (s *Server) dashboardHandler(w http.ResponseWriter, r *http.Request) {

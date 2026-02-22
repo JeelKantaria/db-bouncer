@@ -3,7 +3,7 @@ package pool
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -13,15 +13,15 @@ import (
 
 // Stats holds connection pool statistics for a tenant.
 type Stats struct {
-	TenantID   string `json:"tenant_id"`
-	DBType     string `json:"db_type"`
-	Active     int    `json:"active"`
-	Idle       int    `json:"idle"`
-	Total      int    `json:"total"`
-	Waiting    int    `json:"waiting"`
-	MaxConns   int    `json:"max_connections"`
-	MinConns   int    `json:"min_connections"`
-	Exhausted  int64  `json:"pool_exhausted_total"`
+	TenantID  string `json:"tenant_id"`
+	DBType    string `json:"db_type"`
+	Active    int    `json:"active"`
+	Idle      int    `json:"idle"`
+	Total     int    `json:"total"`
+	Waiting   int    `json:"waiting"`
+	MaxConns  int    `json:"max_connections"`
+	MinConns  int    `json:"min_connections"`
+	Exhausted int64  `json:"pool_exhausted_total"`
 }
 
 // OnPoolExhausted is called when a pool reaches max connections and a goroutine must wait.
@@ -43,6 +43,7 @@ type TenantPool struct {
 	idleTimeout    time.Duration
 	maxLifetime    time.Duration
 	acquireTimeout time.Duration
+	dialTimeout    time.Duration
 
 	idle      []*PooledConn
 	active    map[*PooledConn]struct{}
@@ -70,6 +71,7 @@ func NewTenantPool(tenantID string, tc config.TenantConfig, defaults config.Pool
 		idleTimeout:    tc.EffectiveIdleTimeout(defaults),
 		maxLifetime:    tc.EffectiveMaxLifetime(defaults),
 		acquireTimeout: tc.EffectiveAcquireTimeout(defaults),
+		dialTimeout:    tc.EffectiveDialTimeout(defaults),
 		idle:           make([]*PooledConn, 0),
 		active:         make(map[*PooledConn]struct{}),
 		stopCh:         make(chan struct{}),
@@ -103,7 +105,7 @@ func (tp *TenantPool) warmUp() {
 			tp.mu.Lock()
 			tp.total--
 			tp.mu.Unlock()
-			log.Printf("[pool] warm-up connection %d/%d failed for tenant %s: %v", i+1, tp.minConns, tp.tenantID, err)
+			slog.Warn("warm-up connection failed", "index", i+1, "total", tp.minConns, "tenant", tp.tenantID, "err", err)
 			return
 		}
 
@@ -117,7 +119,7 @@ func (tp *TenantPool) warmUp() {
 		tp.idle = append(tp.idle, pc)
 		tp.mu.Unlock()
 	}
-	log.Printf("[pool] pre-warmed %d connections for tenant %s", tp.minConns, tp.tenantID)
+	slog.Info("pre-warmed connections", "count", tp.minConns, "tenant", tp.tenantID)
 }
 
 // Acquire gets a connection from the pool, creating one if needed.
@@ -287,7 +289,7 @@ func (tp *TenantPool) Drain() {
 	tp.mu.Unlock()
 
 	if activeCount > 0 {
-		log.Printf("[pool] draining %d active connections for tenant %s", activeCount, tp.tenantID)
+		slog.Info("draining active connections", "count", activeCount, "tenant", tp.tenantID)
 		timeout := time.After(30 * time.Second)
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
@@ -309,7 +311,7 @@ func (tp *TenantPool) Drain() {
 				}
 				tp.active = make(map[*PooledConn]struct{})
 				tp.mu.Unlock()
-				log.Printf("[pool] force-closed active connections for tenant %s after drain timeout", tp.tenantID)
+				slog.Warn("force-closed active connections after drain timeout", "tenant", tp.tenantID)
 				return
 			}
 		}
@@ -333,7 +335,7 @@ func (tp *TenantPool) Close() {
 
 func (tp *TenantPool) dial(ctx context.Context) (*PooledConn, error) {
 	addr := net.JoinHostPort(tp.host, fmt.Sprintf("%d", tp.port))
-	dialer := net.Dialer{Timeout: 5 * time.Second}
+	dialer := net.Dialer{Timeout: tp.dialTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
@@ -448,7 +450,7 @@ func (m *Manager) GetOrCreate(tenantID string, tc config.TenantConfig) *TenantPo
 	p := NewTenantPool(tenantID, tc, m.defaults)
 	p.onPoolExhausted = m.onPoolExhausted
 	m.pools[tenantID] = p
-	log.Printf("[pool] created pool for tenant %s (%s at %s:%d)", tenantID, tc.DBType, tc.Host, tc.Port)
+	slog.Info("created pool", "tenant", tenantID, "db_type", tc.DBType, "host", tc.Host, "port", tc.Port)
 	return p
 }
 
@@ -472,7 +474,7 @@ func (m *Manager) Remove(tenantID string) bool {
 	m.mu.Unlock()
 
 	p.Close()
-	log.Printf("[pool] removed pool for tenant %s", tenantID)
+	slog.Info("removed pool", "tenant", tenantID)
 	return true
 }
 
