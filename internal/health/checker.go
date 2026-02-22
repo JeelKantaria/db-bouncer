@@ -3,7 +3,7 @@ package health
 import (
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -17,7 +17,7 @@ import (
 type Status int
 
 const (
-	StatusUnknown   Status = iota
+	StatusUnknown Status = iota
 	StatusHealthy
 	StatusUnhealthy
 )
@@ -35,10 +35,10 @@ func (s Status) String() string {
 
 // TenantHealth holds health information for a tenant.
 type TenantHealth struct {
-	Status             Status    `json:"status"`
-	LastCheck          time.Time `json:"last_check"`
-	ConsecutiveFailures int      `json:"consecutive_failures"`
-	LastError          string    `json:"last_error,omitempty"`
+	Status              Status    `json:"status"`
+	LastCheck           time.Time `json:"last_check"`
+	ConsecutiveFailures int       `json:"consecutive_failures"`
+	LastError           string    `json:"last_error,omitempty"`
 }
 
 // Checker performs periodic health checks on tenant databases.
@@ -77,7 +77,7 @@ func (c *Checker) Start() {
 		defer c.wg.Done()
 		c.run()
 	}()
-	log.Printf("[health] checker started (interval=%s, threshold=%d)", c.interval, c.failureThreshold)
+	slog.Info("health checker started", "interval", c.interval, "threshold", c.failureThreshold)
 }
 
 // Stop stops the health checker. Safe to call multiple times.
@@ -86,7 +86,7 @@ func (c *Checker) Stop() {
 		close(c.stopCh)
 	})
 	c.wg.Wait()
-	log.Printf("[health] checker stopped")
+	slog.Info("health checker stopped")
 }
 
 func (c *Checker) run() {
@@ -254,7 +254,7 @@ func (c *Checker) updateStatus(tenantID string, healthy bool) {
 
 	if healthy {
 		if th.ConsecutiveFailures > 0 {
-			log.Printf("[health] tenant %s recovered after %d failures", tenantID, th.ConsecutiveFailures)
+			slog.Info("tenant recovered", "tenant", tenantID, "failures", th.ConsecutiveFailures)
 		}
 		th.Status = StatusHealthy
 		th.ConsecutiveFailures = 0
@@ -263,8 +263,7 @@ func (c *Checker) updateStatus(tenantID string, healthy bool) {
 		th.ConsecutiveFailures++
 		if th.ConsecutiveFailures >= c.failureThreshold {
 			if th.Status != StatusUnhealthy {
-				log.Printf("[health] tenant %s marked unhealthy after %d consecutive failures: %s",
-					tenantID, th.ConsecutiveFailures, th.LastError)
+				slog.Warn("tenant marked unhealthy", "tenant", tenantID, "failures", th.ConsecutiveFailures, "error", th.LastError)
 			}
 			th.Status = StatusUnhealthy
 		}
@@ -331,4 +330,16 @@ func (c *Checker) OverallHealthy() bool {
 		}
 	}
 	return true
+}
+
+// RemoveTenant removes health state for a tenant that has been deleted.
+func (c *Checker) RemoveTenant(tenantID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	delete(c.tenants, tenantID)
+	if c.metrics != nil {
+		c.metrics.RemoveTenant(tenantID)
+	}
+	slog.Info("removed health state", "tenant", tenantID)
 }

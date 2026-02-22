@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"time"
 
@@ -29,6 +29,9 @@ const (
 	mysqlErrPacket byte = 0xff
 	mysqlEOFPacket byte = 0xfe
 )
+
+// Compile-time interface assertion.
+var _ ConnectionHandler = (*MySQLHandler)(nil)
 
 // MySQLHandler handles MySQL wire protocol connections.
 type MySQLHandler struct {
@@ -73,24 +76,24 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 		return fmt.Errorf("no tenant_id in MySQL connection")
 	}
 
-	log.Printf("[mysql] connection from tenant %s", tenantID)
+	slog.Info("connection from tenant", "protocol", "mysql", "tenant", tenantID)
 
 	// Resolve tenant config
 	tc, err := h.router.Resolve(tenantID)
 	if err != nil {
-		h.sendMySQLError(clientConn, 1045, "28000", fmt.Sprintf("unknown tenant: %s", tenantID), errSeq)
+		h.sendMySQLError(clientConn, 1045, "28000", "Access denied", errSeq)
 		return err
 	}
 
 	// Check if tenant is paused
 	if h.router.IsPaused(tenantID) {
-		h.sendMySQLError(clientConn, 1045, "08S01", fmt.Sprintf("tenant %s is paused", tenantID), errSeq)
+		h.sendMySQLError(clientConn, 1045, "08S01", "Access denied", errSeq)
 		return fmt.Errorf("tenant %s is paused", tenantID)
 	}
 
 	// Check health
 	if h.healthCheck != nil && !h.healthCheck.IsHealthy(tenantID) {
-		h.sendMySQLError(clientConn, 1045, "08S01", fmt.Sprintf("tenant %s database is unhealthy", tenantID), errSeq)
+		h.sendMySQLError(clientConn, 1045, "08S01", "Access denied", errSeq)
 		return fmt.Errorf("tenant %s is unhealthy", tenantID)
 	}
 
@@ -98,7 +101,7 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 	tenantPool := h.poolMgr.GetOrCreate(tenantID, tc)
 	pc, err := tenantPool.Acquire(ctx)
 	if err != nil {
-		h.sendMySQLError(clientConn, 1045, "08S01", fmt.Sprintf("cannot connect to database: %s", err), errSeq)
+		h.sendMySQLError(clientConn, 1045, "08S01", "cannot connect to database", errSeq)
 		return err
 	}
 	// Always close the backend connection after relay — the protocol state

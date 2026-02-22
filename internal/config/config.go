@@ -2,7 +2,8 @@ package config
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
+	"net"
 	"os"
 	"regexp"
 	"sync"
@@ -21,13 +22,14 @@ type Config struct {
 
 // ListenConfig defines the ports and bind addresses DBBouncer listens on.
 type ListenConfig struct {
-	PostgresPort int    `yaml:"postgres_port"`
-	MySQLPort    int    `yaml:"mysql_port"`
-	APIPort      int    `yaml:"api_port"`
-	APIBind      string `yaml:"api_bind"`
-	APIKey       string `yaml:"api_key"`
-	TLSCert      string `yaml:"tls_cert"`
-	TLSKey       string `yaml:"tls_key"`
+	PostgresPort        int    `yaml:"postgres_port"`
+	MySQLPort           int    `yaml:"mysql_port"`
+	APIPort             int    `yaml:"api_port"`
+	APIBind             string `yaml:"api_bind"`
+	APIKey              string `yaml:"api_key"`
+	TLSCert             string `yaml:"tls_cert"`
+	TLSKey              string `yaml:"tls_key"`
+	MaxProxyConnections int    `yaml:"max_proxy_connections"`
 }
 
 // PoolDefaults defines default pool settings applied when tenants don't override.
@@ -37,21 +39,23 @@ type PoolDefaults struct {
 	IdleTimeout    time.Duration `yaml:"idle_timeout"`
 	MaxLifetime    time.Duration `yaml:"max_lifetime"`
 	AcquireTimeout time.Duration `yaml:"acquire_timeout"`
+	DialTimeout    time.Duration `yaml:"dial_timeout"`
 }
 
 // TenantConfig holds the database configuration for a single tenant.
 type TenantConfig struct {
-	DBType         string        `yaml:"db_type"`
-	Host           string        `yaml:"host"`
-	Port           int           `yaml:"port"`
-	DBName         string        `yaml:"dbname"`
-	Username       string        `yaml:"username"`
-	Password       string        `yaml:"password"`
-	MinConnections *int          `yaml:"min_connections,omitempty"`
-	MaxConnections *int          `yaml:"max_connections,omitempty"`
+	DBType         string         `yaml:"db_type"`
+	Host           string         `yaml:"host"`
+	Port           int            `yaml:"port"`
+	DBName         string         `yaml:"dbname"`
+	Username       string         `yaml:"username"`
+	Password       string         `yaml:"password"`
+	MinConnections *int           `yaml:"min_connections,omitempty"`
+	MaxConnections *int           `yaml:"max_connections,omitempty"`
 	IdleTimeout    *time.Duration `yaml:"idle_timeout,omitempty"`
 	MaxLifetime    *time.Duration `yaml:"max_lifetime,omitempty"`
 	AcquireTimeout *time.Duration `yaml:"acquire_timeout,omitempty"`
+	DialTimeout    *time.Duration `yaml:"dial_timeout,omitempty"`
 }
 
 // EffectiveMinConnections returns the tenant's min connections or the default.
@@ -94,6 +98,14 @@ func (t TenantConfig) EffectiveAcquireTimeout(defaults PoolDefaults) time.Durati
 	return defaults.AcquireTimeout
 }
 
+// EffectiveDialTimeout returns the tenant's dial timeout or the default.
+func (t TenantConfig) EffectiveDialTimeout(defaults PoolDefaults) time.Duration {
+	if t.DialTimeout != nil {
+		return *t.DialTimeout
+	}
+	return defaults.DialTimeout
+}
+
 // Redacted returns a copy of the TenantConfig with the password masked.
 func (t TenantConfig) Redacted() TenantConfig {
 	c := t
@@ -106,6 +118,17 @@ func (t TenantConfig) Redacted() TenantConfig {
 // TLSEnabled returns true if both TLS cert and key paths are configured.
 func (lc ListenConfig) TLSEnabled() bool {
 	return lc.TLSCert != "" && lc.TLSKey != ""
+}
+
+// tenantIDPattern restricts tenant IDs to Kubernetes-label-safe values.
+var tenantIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`)
+
+// ValidateTenantID returns an error if the tenant ID is not a valid identifier.
+func ValidateTenantID(id string) error {
+	if !tenantIDPattern.MatchString(id) {
+		return fmt.Errorf("tenant ID %q is invalid: must be 1-63 chars, alphanumeric/hyphens/underscores, starting with alphanumeric", id)
+	}
+	return nil
 }
 
 var envVarPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
@@ -171,10 +194,38 @@ func applyDefaults(cfg *Config) {
 	if cfg.Defaults.AcquireTimeout == 0 {
 		cfg.Defaults.AcquireTimeout = 10 * time.Second
 	}
+	if cfg.Defaults.DialTimeout == 0 {
+		cfg.Defaults.DialTimeout = 5 * time.Second
+	}
+	if cfg.Listen.MaxProxyConnections == 0 {
+		cfg.Listen.MaxProxyConnections = 10000
+	}
 }
 
 func validate(cfg *Config) error {
+	// Validate listen port ranges
+	for name, port := range map[string]int{
+		"postgres_port": cfg.Listen.PostgresPort,
+		"mysql_port":    cfg.Listen.MySQLPort,
+		"api_port":      cfg.Listen.APIPort,
+	} {
+		if port != 0 && (port < 1 || port > 65535) {
+			return fmt.Errorf("listen.%s: %d is not a valid port (must be 1-65535)", name, port)
+		}
+	}
+
+	// Validate default pool settings
+	if cfg.Defaults.MinConnections > cfg.Defaults.MaxConnections && cfg.Defaults.MaxConnections > 0 {
+		return fmt.Errorf("defaults: min_connections (%d) must not exceed max_connections (%d)",
+			cfg.Defaults.MinConnections, cfg.Defaults.MaxConnections)
+	}
+
 	for id, tenant := range cfg.Tenants {
+		// Validate tenant ID format
+		if err := ValidateTenantID(id); err != nil {
+			return err
+		}
+
 		if tenant.DBType != "postgres" && tenant.DBType != "mysql" {
 			return fmt.Errorf("tenant %q: unsupported db_type %q (must be postgres or mysql)", id, tenant.DBType)
 		}
@@ -184,11 +235,38 @@ func validate(cfg *Config) error {
 		if tenant.Port == 0 {
 			return fmt.Errorf("tenant %q: port is required", id)
 		}
+		if tenant.Port < 1 || tenant.Port > 65535 {
+			return fmt.Errorf("tenant %q: port %d is not valid (must be 1-65535)", id, tenant.Port)
+		}
 		if tenant.DBName == "" {
 			return fmt.Errorf("tenant %q: dbname is required", id)
 		}
 		if tenant.Username == "" {
 			return fmt.Errorf("tenant %q: username is required", id)
+		}
+
+		// Validate min <= max for per-tenant overrides
+		if tenant.MinConnections != nil && tenant.MaxConnections != nil {
+			if *tenant.MinConnections > *tenant.MaxConnections {
+				return fmt.Errorf("tenant %q: min_connections (%d) must not exceed max_connections (%d)",
+					id, *tenant.MinConnections, *tenant.MaxConnections)
+			}
+		}
+
+		// Warn on unresolved environment variables
+		for field, value := range map[string]string{
+			"host":     tenant.Host,
+			"password": tenant.Password,
+			"username": tenant.Username,
+		} {
+			if envVarPattern.MatchString(value) {
+				slog.Warn("unresolved env var in tenant config", "tenant", id, "field", field, "value", value)
+			}
+		}
+
+		// Validate host is not an IP with port (common misconfiguration)
+		if _, _, err := net.SplitHostPort(tenant.Host); err == nil {
+			return fmt.Errorf("tenant %q: host %q should not include port (use the port field instead)", id, tenant.Host)
 		}
 	}
 	return nil
@@ -248,7 +326,7 @@ func (cw *Watcher) run() {
 			if !ok {
 				return
 			}
-			log.Printf("[config] watcher error: %v", err)
+			slog.Error("config watcher error", "err", err)
 		case <-cw.stopCh:
 			return
 		}
@@ -261,11 +339,11 @@ func (cw *Watcher) reload() {
 
 	cfg, err := Load(cw.path)
 	if err != nil {
-		log.Printf("[config] hot-reload failed: %v", err)
+		slog.Error("hot-reload failed", "err", err)
 		return
 	}
 
-	log.Printf("[config] configuration reloaded from %s", cw.path)
+	slog.Info("configuration reloaded", "path", cw.path)
 	cw.callback(cfg)
 }
 

@@ -1,9 +1,9 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ .Release.Name }}-config
+  name: {{ include "dbbouncer.fullname" . }}-config
   labels:
-    app: {{ .Release.Name }}
+    {{- include "dbbouncer.labels" . | nindent 4 }}
 data:
   dbbouncer.yaml: |
     {{- toYaml .Values.config | nindent 4 }}

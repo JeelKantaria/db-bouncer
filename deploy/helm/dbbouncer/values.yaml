@@ -2,7 +2,7 @@ replicaCount: 2
 
 image:
   repository: dbbouncer
-  tag: latest
+  tag: ""  # defaults to Chart.AppVersion
   pullPolicy: IfNotPresent
 
 service:
@@ -19,6 +19,14 @@ resources:
     cpu: 500m
     memory: 256Mi
 
+securityContext:
+  runAsNonRoot: true
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
 config:
   listen:
     postgres_port: 6432
@@ -30,12 +38,20 @@ config:
     idle_timeout: 5m
     max_lifetime: 30m
     acquire_timeout: 10s
+    dial_timeout: 5s
   tenants: {}
 
 serviceMonitor:
   enabled: false
   interval: 30s
   namespace: ""
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+podAntiAffinity:
+  enabled: true
 
 podAnnotations: {}
 

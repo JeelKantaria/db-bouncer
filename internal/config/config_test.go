@@ -173,6 +173,7 @@ func TestTenantConfigEffectiveValues(t *testing.T) {
 		IdleTimeout:    5 * time.Minute,
 		MaxLifetime:    30 * time.Minute,
 		AcquireTimeout: 10 * time.Second,
+		DialTimeout:    5 * time.Second,
 	}
 
 	maxConn := 50
@@ -188,6 +189,166 @@ func TestTenantConfigEffectiveValues(t *testing.T) {
 	}
 	if tc.EffectiveIdleTimeout(defaults) != 5*time.Minute {
 		t.Error("expected default idle timeout")
+	}
+	if tc.EffectiveDialTimeout(defaults) != 5*time.Second {
+		t.Error("expected default dial timeout of 5s")
+	}
+
+	// Override dial timeout
+	dt := 3 * time.Second
+	tc.DialTimeout = &dt
+	if tc.EffectiveDialTimeout(defaults) != 3*time.Second {
+		t.Error("expected overridden dial timeout of 3s")
+	}
+}
+
+// --- Phase 4 validation tests ---
+
+func TestValidateMinGtMaxConns(t *testing.T) {
+	yaml := `
+defaults:
+  min_connections: 30
+  max_connections: 10
+tenants: {}
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error when min_connections > max_connections")
+	}
+}
+
+func TestValidateInvalidPort(t *testing.T) {
+	yaml := `
+listen:
+  postgres_port: 99999
+tenants: {}
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error for invalid listen port")
+	}
+}
+
+func TestValidateTenantInvalidPort(t *testing.T) {
+	yaml := `
+tenants:
+  t1:
+    db_type: postgres
+    host: localhost
+    port: 70000
+    dbname: db
+    username: user
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error for invalid tenant port")
+	}
+}
+
+func TestValidateInvalidTenantID(t *testing.T) {
+	yaml := `
+tenants:
+  "invalid tenant!":
+    db_type: postgres
+    host: localhost
+    port: 5432
+    dbname: db
+    username: user
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error for invalid tenant ID")
+	}
+}
+
+func TestValidateTenantMinGtMax(t *testing.T) {
+	yaml := `
+tenants:
+  t1:
+    db_type: postgres
+    host: localhost
+    port: 5432
+    dbname: db
+    username: user
+    min_connections: 20
+    max_connections: 5
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error when tenant min_connections > max_connections")
+	}
+}
+
+func TestValidateHostWithPort(t *testing.T) {
+	yaml := `
+tenants:
+  t1:
+    db_type: postgres
+    host: "localhost:5432"
+    port: 5432
+    dbname: db
+    username: user
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error for host containing port")
+	}
+}
+
+func TestValidateTenantID(t *testing.T) {
+	tests := []struct {
+		id      string
+		wantErr bool
+	}{
+		{"valid-tenant", false},
+		{"tenant_123", false},
+		{"a", false},
+		{"", true},
+		{"-starts-with-dash", true},
+		{"_starts-with-underscore", true},
+		{"has spaces", true},
+		{"has.dots", true},
+		{"UPPERCASE_OK", false},
+	}
+	for _, tt := range tests {
+		err := ValidateTenantID(tt.id)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("ValidateTenantID(%q) err=%v, wantErr=%v", tt.id, err, tt.wantErr)
+		}
+	}
+}
+
+func TestDialTimeoutDefault(t *testing.T) {
+	yaml := `
+tenants: {}
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.Defaults.DialTimeout != 5*time.Second {
+		t.Errorf("expected default dial timeout 5s, got %v", cfg.Defaults.DialTimeout)
+	}
+}
+
+func TestMaxProxyConnectionsDefault(t *testing.T) {
+	yaml := `
+tenants: {}
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.Listen.MaxProxyConnections != 10000 {
+		t.Errorf("expected default max_proxy_connections 10000, got %d", cfg.Listen.MaxProxyConnections)
 	}
 }
 

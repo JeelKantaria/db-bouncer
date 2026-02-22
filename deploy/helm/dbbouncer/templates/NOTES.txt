@@ -1,0 +1,13 @@
+DBBouncer has been deployed!
+
+To connect via PostgreSQL:
+  kubectl port-forward svc/{{ .Release.Name }} {{ .Values.service.postgresPort }}:{{ .Values.service.postgresPort }}
+
+To connect via MySQL:
+  kubectl port-forward svc/{{ .Release.Name }} {{ .Values.service.mysqlPort }}:{{ .Values.service.mysqlPort }}
+
+To access the API:
+  kubectl port-forward svc/{{ .Release.Name }} {{ .Values.service.apiPort }}:{{ .Values.service.apiPort }}
+
+Health check:
+  curl http://localhost:{{ .Values.service.apiPort }}/health

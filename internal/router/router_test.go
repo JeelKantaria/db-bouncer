@@ -148,10 +148,10 @@ func TestReload(t *testing.T) {
 
 func TestExtractTenantFromUsername(t *testing.T) {
 	tests := []struct {
-		username       string
-		wantTenant     string
-		wantUser       string
-		wantOk         bool
+		username   string
+		wantTenant string
+		wantUser   string
+		wantOk     bool
 	}{
 		{"tenant_1__appuser", "tenant_1", "appuser", true},
 		{"mycompany..admin", "mycompany", "admin", true},
@@ -167,5 +167,50 @@ func TestExtractTenantFromUsername(t *testing.T) {
 					tt.username, tenant, user, ok, tt.wantTenant, tt.wantUser, tt.wantOk)
 			}
 		})
+	}
+}
+
+func TestPauseResumeTenant(t *testing.T) {
+	r := New(newTestConfig())
+
+	// Initially not paused
+	if r.IsPaused("tenant_1") {
+		t.Error("tenant_1 should not be paused initially")
+	}
+
+	// Pause
+	if !r.PauseTenant("tenant_1") {
+		t.Error("PauseTenant should return true for existing tenant")
+	}
+	if !r.IsPaused("tenant_1") {
+		t.Error("tenant_1 should be paused")
+	}
+
+	// Other tenant unaffected
+	if r.IsPaused("tenant_2") {
+		t.Error("tenant_2 should not be paused")
+	}
+
+	// Resume
+	if !r.ResumeTenant("tenant_1") {
+		t.Error("ResumeTenant should return true for existing tenant")
+	}
+	if r.IsPaused("tenant_1") {
+		t.Error("tenant_1 should not be paused after resume")
+	}
+
+	// Pause nonexistent
+	if r.PauseTenant("nonexistent") {
+		t.Error("PauseTenant should return false for nonexistent tenant")
+	}
+	if r.ResumeTenant("nonexistent") {
+		t.Error("ResumeTenant should return false for nonexistent tenant")
+	}
+
+	// Pause then remove — paused state should be cleaned up
+	r.PauseTenant("tenant_1")
+	r.RemoveTenant("tenant_1")
+	if r.IsPaused("tenant_1") {
+		t.Error("paused state should be cleaned up after removal")
 	}
 }

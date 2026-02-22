@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"net"
 	"testing"
+	"time"
 )
 
 func TestParseTenantFromOptions(t *testing.T) {
@@ -28,64 +30,107 @@ func TestParseTenantFromOptions(t *testing.T) {
 }
 
 func TestWriteReadPGMessage(t *testing.T) {
-	// Use net.Pipe to test message round-trip
-	// Create a simple test with a known message
-	payload := []byte("test payload")
-	msgType := byte('Q')
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
 
-	// Calculate expected wire format
-	msgLen := len(payload) + 4
-	expected := make([]byte, 1+4+len(payload))
-	expected[0] = msgType
-	expected[1] = byte(msgLen >> 24)
-	expected[2] = byte(msgLen >> 16)
-	expected[3] = byte(msgLen >> 8)
-	expected[4] = byte(msgLen)
-	copy(expected[5:], payload)
+	payload := []byte("SELECT 1")
+	go func() {
+		writePGMessage(server, pgMsgQuery, payload)
+	}()
 
-	// Verify the format
-	if expected[0] != 'Q' {
-		t.Error("message type mismatch")
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	msgType, received, err := readPGMessage(client)
+	if err != nil {
+		t.Fatalf("readPGMessage error: %v", err)
 	}
-	if int(expected[1])<<24|int(expected[2])<<16|int(expected[3])<<8|int(expected[4]) != msgLen {
-		t.Error("message length mismatch")
+	if msgType != pgMsgQuery {
+		t.Errorf("expected message type 'Q', got %c", msgType)
+	}
+	if string(received) != "SELECT 1" {
+		t.Errorf("expected payload 'SELECT 1', got %q", received)
+	}
+}
+
+func TestWriteReadMySQLPacket(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	payload := []byte{mysqlComQuery}
+	payload = append(payload, "SELECT 1"...)
+
+	go func() {
+		writeMySQLPacket(server, payload, 0)
+	}()
+
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	received, seqNum, err := readMySQLPacket(client)
+	if err != nil {
+		t.Fatalf("readMySQLPacket error: %v", err)
+	}
+	if seqNum != 0 {
+		t.Errorf("expected seq 0, got %d", seqNum)
+	}
+	if received[0] != mysqlComQuery {
+		t.Errorf("expected COM_QUERY (0x03), got 0x%02x", received[0])
+	}
+	if string(received[1:]) != "SELECT 1" {
+		t.Errorf("expected 'SELECT 1', got %q", received[1:])
 	}
 }
 
 func TestSendPGErrorFormat(t *testing.T) {
-	// Test that error message is properly formatted
-	// We can't easily test the full send without a connection,
-	// but we can verify the buffer construction logic
-	severity := "FATAL"
-	code := "08000"
-	message := "test error"
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
 
-	var buf []byte
-	buf = append(buf, 'S')
-	buf = append(buf, severity...)
-	buf = append(buf, 0)
-	buf = append(buf, 'C')
-	buf = append(buf, code...)
-	buf = append(buf, 0)
-	buf = append(buf, 'M')
-	buf = append(buf, message...)
-	buf = append(buf, 0)
-	buf = append(buf, 0)
+	h := &PostgresHandler{}
 
-	// Verify structure
-	if buf[0] != 'S' {
-		t.Error("expected severity field marker 'S'")
+	go func() {
+		h.sendPGError(server, "FATAL", "08000", "test error message")
+		server.Close()
+	}()
+
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	msgType, payload, err := readPGMessage(client)
+	if err != nil {
+		t.Fatalf("readPGMessage error: %v", err)
+	}
+	if msgType != pgMsgErrorResponse {
+		t.Errorf("expected ErrorResponse message type, got %c", msgType)
 	}
 
-	// Find code field
-	found := false
-	for i, b := range buf {
-		if b == 'C' && i > 0 && buf[i-1] == 0 {
-			found = true
+	// Parse the error fields from the payload
+	var severity, code, message string
+	for i := 0; i < len(payload); i++ {
+		fieldType := payload[i]
+		if fieldType == 0 {
 			break
 		}
+		i++
+		end := i
+		for end < len(payload) && payload[end] != 0 {
+			end++
+		}
+		switch fieldType {
+		case 'S':
+			severity = string(payload[i:end])
+		case 'C':
+			code = string(payload[i:end])
+		case 'M':
+			message = string(payload[i:end])
+		}
+		i = end
 	}
-	if !found {
-		t.Error("code field marker not found")
+
+	if severity != "FATAL" {
+		t.Errorf("expected severity FATAL, got %q", severity)
+	}
+	if code != "08000" {
+		t.Errorf("expected code 08000, got %q", code)
+	}
+	if message != "test error message" {
+		t.Errorf("expected message 'test error message', got %q", message)
 	}
 }

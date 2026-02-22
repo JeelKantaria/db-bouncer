@@ -4,9 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/dbbouncer/dbbouncer/internal/config"
 	"github.com/dbbouncer/dbbouncer/internal/health"
@@ -26,9 +27,11 @@ type Server struct {
 	pgListener    net.Listener
 	mysqlListener net.Listener
 
-	wg     sync.WaitGroup
-	ctx    context.Context
-	cancel context.CancelFunc
+	wg          sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+	activeConns atomic.Int64
+	maxConns    int
 }
 
 // NewServer creates a new proxy server.
@@ -41,18 +44,19 @@ func NewServer(r *router.Router, pm *pool.Manager, hc *health.Checker, m *metric
 		metrics:     m,
 		ctx:         ctx,
 		cancel:      cancel,
+		maxConns:    lc.MaxProxyConnections,
 	}
 
 	if lc.TLSEnabled() {
 		cert, err := tls.LoadX509KeyPair(lc.TLSCert, lc.TLSKey)
 		if err != nil {
-			log.Printf("[proxy] WARNING: failed to load TLS cert/key: %v — TLS disabled", err)
+			slog.Warn("failed to load TLS cert/key — TLS disabled", "err", err)
 		} else {
 			s.tlsConfig = &tls.Config{
 				Certificates: []tls.Certificate{cert},
 				MinVersion:   tls.VersionTLS12,
 			}
-			log.Printf("[proxy] TLS enabled (cert: %s)", lc.TLSCert)
+			slog.Info("TLS enabled", "cert", lc.TLSCert)
 		}
 	}
 
@@ -67,7 +71,7 @@ func (s *Server) ListenPostgres(port int) error {
 		return fmt.Errorf("listening on %s for postgres: %w", addr, err)
 	}
 	s.pgListener = ln
-	log.Printf("[proxy] PostgreSQL proxy listening on %s", addr)
+	slog.Info("PostgreSQL proxy listening", "addr", addr)
 
 	s.wg.Add(1)
 	go func() {
@@ -86,7 +90,7 @@ func (s *Server) ListenMySQL(port int) error {
 		return fmt.Errorf("listening on %s for mysql: %w", addr, err)
 	}
 	s.mysqlListener = ln
-	log.Printf("[proxy] MySQL proxy listening on %s", addr)
+	slog.Info("MySQL proxy listening", "addr", addr)
 
 	s.wg.Add(1)
 	go func() {
@@ -105,14 +109,24 @@ func (s *Server) acceptLoop(ln net.Listener, dbType string) {
 			case <-s.ctx.Done():
 				return
 			default:
-				log.Printf("[proxy] accept error on %s: %v", dbType, err)
+				slog.Error("accept error", "db_type", dbType, "err", err)
 				continue
 			}
 		}
 
+		// Enforce global connection limit
+		if s.maxConns > 0 && s.activeConns.Load() >= int64(s.maxConns) {
+			slog.Warn("connection limit reached, rejecting",
+				"limit", s.maxConns, "db_type", dbType, "remote_addr", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+
+		s.activeConns.Add(1)
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer s.activeConns.Add(-1)
 			s.handleConnection(conn, dbType)
 		}()
 	}
@@ -139,12 +153,12 @@ func (s *Server) handleConnection(clientConn net.Conn, dbType string) {
 			metrics:     s.metrics,
 		}
 	default:
-		log.Printf("[proxy] unknown db type: %s", dbType)
+		slog.Error("unknown db type", "db_type", dbType)
 		return
 	}
 
 	if err := handler.Handle(s.ctx, clientConn); err != nil {
-		log.Printf("[proxy] connection error (%s): %v", dbType, err)
+		slog.Error("connection error", "db_type", dbType, "err", err)
 	}
 }
 
@@ -160,5 +174,5 @@ func (s *Server) Stop() {
 	}
 
 	s.wg.Wait()
-	log.Printf("[proxy] server stopped")
+	slog.Info("proxy server stopped")
 }

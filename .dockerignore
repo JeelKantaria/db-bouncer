@@ -1,0 +1,12 @@
+.git
+bin/
+tmp/
+*.exe
+deploy/
+README.md
+Makefile
+.idea/
+.vscode/
+*.md
+!go.mod
+!go.sum
