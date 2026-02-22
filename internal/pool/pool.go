@@ -244,15 +244,17 @@ func (tp *TenantPool) Return(pc *PooledConn) {
 	if tp.closed || pc.IsExpired(tp.maxLifetime) {
 		pc.Close()
 		tp.total--
-		tp.cond.Broadcast()
+		tp.cond.Signal()
 		return
 	}
 
 	pc.MarkIdle()
 	tp.idle = append(tp.idle, pc)
 
-	// Wake all waiting goroutines so they can retry
-	tp.cond.Broadcast()
+	// Wake one waiting goroutine — Signal() avoids the thundering herd problem
+	// where Broadcast() would wake all waiters only for N-1 to go back to sleep.
+	// Broadcast() is reserved for Close() and timeout wakeups.
+	tp.cond.Signal()
 }
 
 // Stats returns current pool statistics.
@@ -335,7 +337,10 @@ func (tp *TenantPool) Close() {
 
 func (tp *TenantPool) dial(ctx context.Context) (*PooledConn, error) {
 	addr := net.JoinHostPort(tp.host, fmt.Sprintf("%d", tp.port))
-	dialer := net.Dialer{Timeout: tp.dialTimeout}
+	dialer := net.Dialer{
+		Timeout:   tp.dialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err

@@ -12,6 +12,20 @@ type ConnectionHandler interface {
 	Handle(ctx context.Context, clientConn net.Conn) error
 }
 
+// relayBufSize is the buffer size used for bidirectional relay.
+// 32KB matches Go's default io.Copy buffer size.
+const relayBufSize = 32 * 1024
+
+// relayBufPool reuses buffers across relay goroutines to reduce GC pressure.
+// Without this, io.Copy allocates a fresh 32KB buffer per direction per session.
+// At 10K concurrent sessions, that's ~640MB of transient allocations.
+var relayBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, relayBufSize)
+		return &buf
+	},
+}
+
 // relay copies data bidirectionally between client and backend connections.
 // It returns when either side closes, an error occurs, or the context is cancelled.
 // Both connections are closed on exit to ensure neither goroutine leaks.
@@ -24,7 +38,9 @@ func relay(ctx context.Context, client, backend net.Conn) error {
 	// Client → Backend
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(backend, client)
+		bufp := relayBufPool.Get().(*[]byte)
+		defer relayBufPool.Put(bufp)
+		_, err := io.CopyBuffer(backend, client, *bufp)
 		errCh <- err
 		// Signal the backend that the client is done writing
 		if tc, ok := backend.(*net.TCPConn); ok {
@@ -35,7 +51,9 @@ func relay(ctx context.Context, client, backend net.Conn) error {
 	// Backend → Client
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(client, backend)
+		bufp := relayBufPool.Get().(*[]byte)
+		defer relayBufPool.Put(bufp)
+		_, err := io.CopyBuffer(client, backend, *bufp)
 		errCh <- err
 		// Signal the client that the backend is done writing
 		if tc, ok := client.(*net.TCPConn); ok {

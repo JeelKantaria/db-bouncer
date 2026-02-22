@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 
@@ -35,7 +36,11 @@ func newTestServer() (*Server, *mux.Router) {
 
 	r := router.New(cfg)
 	pm := pool.NewManager(cfg.Defaults)
-	hc := health.NewChecker(r, nil)
+	hc := health.NewChecker(r, nil, config.HealthCheckConfig{
+		Interval:          30 * time.Second,
+		FailureThreshold:  3,
+		ConnectionTimeout: 5 * time.Second,
+	})
 
 	s := NewServer(r, pm, hc, nil, config.ListenConfig{})
 
@@ -239,7 +244,11 @@ func newTestServerWithAuth(apiKey string) (*Server, http.Handler) {
 
 	r := router.New(cfg)
 	pm := pool.NewManager(cfg.Defaults)
-	hc := health.NewChecker(r, nil)
+	hc := health.NewChecker(r, nil, config.HealthCheckConfig{
+		Interval:          30 * time.Second,
+		FailureThreshold:  3,
+		ConnectionTimeout: 5 * time.Second,
+	})
 
 	lc := config.ListenConfig{APIKey: apiKey}
 	s := NewServer(r, pm, hc, nil, lc)

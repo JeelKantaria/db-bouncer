@@ -2,10 +2,17 @@ package health
 
 import (
 	"testing"
+	"time"
 
 	"github.com/dbbouncer/dbbouncer/internal/config"
 	"github.com/dbbouncer/dbbouncer/internal/router"
 )
+
+var testHealthCfg = config.HealthCheckConfig{
+	Interval:          30 * time.Second,
+	FailureThreshold:  3,
+	ConnectionTimeout: 5 * time.Second,
+}
 
 func newTestRouter() *router.Router {
 	return router.New(&config.Config{
@@ -22,7 +29,7 @@ func newTestRouter() *router.Router {
 }
 
 func TestCheckerInitialState(t *testing.T) {
-	c := NewChecker(newTestRouter(), nil)
+	c := NewChecker(newTestRouter(), nil, testHealthCfg)
 
 	// Unknown tenant should be treated as healthy
 	if !c.IsHealthy("unknown") {
@@ -36,7 +43,7 @@ func TestCheckerInitialState(t *testing.T) {
 }
 
 func TestCheckerUpdateStatus(t *testing.T) {
-	c := NewChecker(newTestRouter(), nil)
+	c := NewChecker(newTestRouter(), nil, testHealthCfg)
 
 	// Mark as healthy
 	c.updateStatus("test", true)
@@ -62,7 +69,7 @@ func TestCheckerUpdateStatus(t *testing.T) {
 }
 
 func TestCheckerThreshold(t *testing.T) {
-	c := NewChecker(newTestRouter(), nil)
+	c := NewChecker(newTestRouter(), nil, testHealthCfg)
 
 	// Hit the failure threshold (default 3)
 	c.updateStatus("test", false)
@@ -80,7 +87,7 @@ func TestCheckerThreshold(t *testing.T) {
 }
 
 func TestCheckerRecovery(t *testing.T) {
-	c := NewChecker(newTestRouter(), nil)
+	c := NewChecker(newTestRouter(), nil, testHealthCfg)
 
 	// Mark as unhealthy
 	c.updateStatus("test", false)
@@ -104,7 +111,7 @@ func TestCheckerRecovery(t *testing.T) {
 }
 
 func TestOverallHealthy(t *testing.T) {
-	c := NewChecker(newTestRouter(), nil)
+	c := NewChecker(newTestRouter(), nil, testHealthCfg)
 
 	// No tenants checked yet
 	if !c.OverallHealthy() {
@@ -127,7 +134,7 @@ func TestOverallHealthy(t *testing.T) {
 }
 
 func TestGetAllStatuses(t *testing.T) {
-	c := NewChecker(newTestRouter(), nil)
+	c := NewChecker(newTestRouter(), nil, testHealthCfg)
 
 	c.updateStatus("t1", true)
 	c.updateStatus("t2", true)
@@ -156,7 +163,7 @@ func TestStatusString(t *testing.T) {
 }
 
 func TestDoubleStop(t *testing.T) {
-	c := NewChecker(newTestRouter(), nil)
+	c := NewChecker(newTestRouter(), nil, testHealthCfg)
 	c.Start()
 
 	// Should not panic
@@ -173,7 +180,7 @@ func TestCheckAllIsParallel(t *testing.T) {
 			"t3": {DBType: "postgres", Host: "localhost", Port: 59993, DBName: "db", Username: "u"},
 		},
 	})
-	c := NewChecker(r, nil)
+	c := NewChecker(r, nil, testHealthCfg)
 
 	// checkAll should not panic and should update all tenant statuses
 	// (will fail health checks since ports don't exist, but that's fine)
@@ -193,7 +200,7 @@ func TestPingTenantProtocolCheck(t *testing.T) {
 			"my": {DBType: "mysql", Host: "localhost", Port: 59998, DBName: "db", Username: "u"},
 		},
 	})
-	c := NewChecker(r, nil)
+	c := NewChecker(r, nil, testHealthCfg)
 
 	tc, _ := r.Resolve("pg")
 	if c.pingTenant("pg", tc) {
@@ -209,7 +216,7 @@ func TestPingTenantProtocolCheck(t *testing.T) {
 // --- Phase 4: RemoveTenant test ---
 
 func TestRemoveTenant(t *testing.T) {
-	c := NewChecker(newTestRouter(), nil)
+	c := NewChecker(newTestRouter(), nil, testHealthCfg)
 
 	// Add some health state
 	c.updateStatus("tenant_a", true)

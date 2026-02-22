@@ -57,15 +57,15 @@ type Checker struct {
 	wg       sync.WaitGroup
 }
 
-// NewChecker creates a new health checker.
-func NewChecker(r *router.Router, m *metrics.Collector) *Checker {
+// NewChecker creates a new health checker with configurable parameters.
+func NewChecker(r *router.Router, m *metrics.Collector, hcCfg config.HealthCheckConfig) *Checker {
 	return &Checker{
 		tenants:           make(map[string]*TenantHealth),
 		router:            r,
 		metrics:           m,
-		interval:          30 * time.Second,
-		failureThreshold:  3,
-		connectionTimeout: 5 * time.Second,
+		interval:          hcCfg.Interval,
+		failureThreshold:  hcCfg.FailureThreshold,
+		connectionTimeout: hcCfg.ConnectionTimeout,
 		stopCh:            make(chan struct{}),
 	}
 }

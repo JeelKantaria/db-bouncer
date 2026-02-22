@@ -4,37 +4,71 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/dbbouncer/dbbouncer/internal/config"
 )
 
-// Router resolves tenant IDs to their database configurations.
-type Router struct {
-	mu       sync.RWMutex
+// routerSnapshot is an immutable point-in-time view of the routing table.
+// Stored in atomic.Value for lock-free reads on the hot path.
+type routerSnapshot struct {
 	tenants  map[string]config.TenantConfig
 	defaults config.PoolDefaults
 	paused   map[string]bool
 }
 
+// Router resolves tenant IDs to their database configurations.
+// Resolve() and IsPaused() are lock-free via atomic.Value.
+// Mutations serialize on a write mutex and swap in a new snapshot.
+type Router struct {
+	snap atomic.Value // holds *routerSnapshot
+	wmu  sync.Mutex   // serializes mutations (writes are rare)
+}
+
 // New creates a new Router populated from the given config.
 func New(cfg *config.Config) *Router {
-	r := &Router{
+	snap := &routerSnapshot{
 		tenants:  make(map[string]config.TenantConfig, len(cfg.Tenants)),
 		defaults: cfg.Defaults,
 		paused:   make(map[string]bool),
 	}
 	for id, tc := range cfg.Tenants {
-		r.tenants[id] = tc
+		snap.tenants[id] = tc
 	}
+
+	r := &Router{}
+	r.snap.Store(snap)
 	return r
 }
 
-// Resolve looks up the TenantConfig for the given tenant ID.
-func (r *Router) Resolve(tenantID string) (config.TenantConfig, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+// load returns the current immutable snapshot (lock-free).
+func (r *Router) load() *routerSnapshot {
+	return r.snap.Load().(*routerSnapshot)
+}
 
-	tc, ok := r.tenants[tenantID]
+// cloneSnap returns a mutable deep copy of the current snapshot.
+// Must be called with wmu held.
+func (r *Router) cloneSnap() *routerSnapshot {
+	cur := r.load()
+	newTenants := make(map[string]config.TenantConfig, len(cur.tenants))
+	for id, tc := range cur.tenants {
+		newTenants[id] = tc
+	}
+	newPaused := make(map[string]bool, len(cur.paused))
+	for id, v := range cur.paused {
+		newPaused[id] = v
+	}
+	return &routerSnapshot{
+		tenants:  newTenants,
+		defaults: cur.defaults,
+		paused:   newPaused,
+	}
+}
+
+// Resolve looks up the TenantConfig for the given tenant ID. Lock-free.
+func (r *Router) Resolve(tenantID string) (config.TenantConfig, error) {
+	snap := r.load()
+	tc, ok := snap.tenants[tenantID]
 	if !ok {
 		return config.TenantConfig{}, fmt.Errorf("unknown tenant: %q", tenantID)
 	}
@@ -43,83 +77,108 @@ func (r *Router) Resolve(tenantID string) (config.TenantConfig, error) {
 
 // AddTenant registers or updates a tenant configuration.
 func (r *Router) AddTenant(tenantID string, tc config.TenantConfig) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.tenants[tenantID] = tc
+	r.wmu.Lock()
+	defer r.wmu.Unlock()
+
+	s := r.cloneSnap()
+	s.tenants[tenantID] = tc
+	r.snap.Store(s)
 }
 
 // RemoveTenant removes a tenant from the router.
 func (r *Router) RemoveTenant(tenantID string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.tenants[tenantID]; !ok {
+	r.wmu.Lock()
+	defer r.wmu.Unlock()
+
+	cur := r.load()
+	if _, ok := cur.tenants[tenantID]; !ok {
 		return false
 	}
-	delete(r.tenants, tenantID)
-	delete(r.paused, tenantID)
+
+	s := r.cloneSnap()
+	delete(s.tenants, tenantID)
+	delete(s.paused, tenantID)
+	r.snap.Store(s)
 	return true
 }
 
 // PauseTenant marks a tenant as paused. Returns false if tenant not found.
 func (r *Router) PauseTenant(tenantID string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.tenants[tenantID]; !ok {
+	r.wmu.Lock()
+	defer r.wmu.Unlock()
+
+	cur := r.load()
+	if _, ok := cur.tenants[tenantID]; !ok {
 		return false
 	}
-	r.paused[tenantID] = true
+
+	s := r.cloneSnap()
+	s.paused[tenantID] = true
+	r.snap.Store(s)
 	return true
 }
 
 // ResumeTenant unpauses a tenant. Returns false if tenant not found.
 func (r *Router) ResumeTenant(tenantID string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.tenants[tenantID]; !ok {
+	r.wmu.Lock()
+	defer r.wmu.Unlock()
+
+	cur := r.load()
+	if _, ok := cur.tenants[tenantID]; !ok {
 		return false
 	}
-	delete(r.paused, tenantID)
+
+	s := r.cloneSnap()
+	delete(s.paused, tenantID)
+	r.snap.Store(s)
 	return true
 }
 
-// IsPaused returns whether a tenant is currently paused.
+// IsPaused returns whether a tenant is currently paused. Lock-free.
 func (r *Router) IsPaused(tenantID string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.paused[tenantID]
+	return r.load().paused[tenantID]
 }
 
 // ListTenants returns all tenant IDs and their configs.
 func (r *Router) ListTenants() map[string]config.TenantConfig {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	result := make(map[string]config.TenantConfig, len(r.tenants))
-	for id, tc := range r.tenants {
+	snap := r.load()
+	result := make(map[string]config.TenantConfig, len(snap.tenants))
+	for id, tc := range snap.tenants {
 		result[id] = tc
 	}
 	return result
 }
 
-// Defaults returns the current pool defaults.
+// Defaults returns the current pool defaults. Lock-free.
 func (r *Router) Defaults() config.PoolDefaults {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.defaults
+	return r.load().defaults
 }
 
 // Reload replaces the entire routing table from a new config.
+// Preserves paused state for tenants that still exist in the new config.
 func (r *Router) Reload(cfg *config.Config) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.wmu.Lock()
+	defer r.wmu.Unlock()
 
-	r.defaults = cfg.Defaults
+	cur := r.load()
 	newTenants := make(map[string]config.TenantConfig, len(cfg.Tenants))
 	for id, tc := range cfg.Tenants {
 		newTenants[id] = tc
 	}
-	r.tenants = newTenants
-	r.paused = make(map[string]bool)
+
+	// Carry over paused state for tenants that still exist
+	newPaused := make(map[string]bool)
+	for id, v := range cur.paused {
+		if _, exists := newTenants[id]; exists {
+			newPaused[id] = v
+		}
+	}
+
+	r.snap.Store(&routerSnapshot{
+		tenants:  newTenants,
+		defaults: cfg.Defaults,
+		paused:   newPaused,
+	})
 }
 
 // ExtractTenantFromUsername parses tenant ID from username formats like "tenant_123_appuser".
