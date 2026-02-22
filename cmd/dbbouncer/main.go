@@ -2,7 +2,7 @@ package main
 
 import (
 	"flag"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,25 +17,27 @@ import (
 	"github.com/dbbouncer/dbbouncer/internal/router"
 )
 
+const shutdownTimeout = 60 * time.Second
+
 func main() {
 	configPath := flag.String("config", "configs/dbbouncer.yaml", "path to configuration file")
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("DBBouncer starting...")
+	slog.Info("DBBouncer starting...")
 
 	// Load configuration
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		slog.Error("failed to load config", "err", err)
+		os.Exit(1)
 	}
-	log.Printf("Configuration loaded from %s (%d tenants)", *configPath, len(cfg.Tenants))
+	slog.Info("configuration loaded", "path", *configPath, "tenants", len(cfg.Tenants))
 
 	// Initialize components
 	m := metrics.New()
 	r := router.New(cfg)
 	pm := pool.NewManager(cfg.Defaults)
-	hc := health.NewChecker(r, m)
+	hc := health.NewChecker(r, m, cfg.HealthCheck)
 
 	// Wire up pool exhaustion metric
 	pm.SetOnPoolExhausted(func(tenantID string) {
@@ -54,46 +56,61 @@ func main() {
 	proxyServer := proxy.NewServer(r, pm, hc, m, cfg.Listen)
 
 	if err := proxyServer.ListenPostgres(cfg.Listen.PostgresPort); err != nil {
-		log.Fatalf("Failed to start PostgreSQL proxy: %v", err)
+		slog.Error("failed to start PostgreSQL proxy", "err", err)
+		os.Exit(1)
 	}
 
 	if err := proxyServer.ListenMySQL(cfg.Listen.MySQLPort); err != nil {
-		log.Fatalf("Failed to start MySQL proxy: %v", err)
+		slog.Error("failed to start MySQL proxy", "err", err)
+		os.Exit(1)
 	}
 
 	// Start REST API
 	apiServer := api.NewServer(r, pm, hc, m, cfg.Listen)
 	if err := apiServer.Start(cfg.Listen.APIPort); err != nil {
-		log.Fatalf("Failed to start API server: %v", err)
+		slog.Error("failed to start API server", "err", err)
+		os.Exit(1)
 	}
 
 	// Set up config hot-reload
 	configWatcher, err := config.NewWatcher(*configPath, func(newCfg *config.Config) {
-		log.Printf("Reloading configuration...")
+		slog.Info("reloading configuration...")
 		r.Reload(newCfg)
 		pm.UpdateDefaults(newCfg.Defaults)
 	})
 	if err != nil {
-		log.Printf("Warning: config hot-reload not available: %v", err)
+		slog.Warn("config hot-reload not available", "err", err)
 	}
 
-	log.Printf("DBBouncer ready - PG:%d MySQL:%d API:%d",
-		cfg.Listen.PostgresPort, cfg.Listen.MySQLPort, cfg.Listen.APIPort)
+	slog.Info("DBBouncer ready",
+		"pg_port", cfg.Listen.PostgresPort,
+		"mysql_port", cfg.Listen.MySQLPort,
+		"api_port", cfg.Listen.APIPort)
 
 	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
-	log.Printf("Received signal %s, shutting down...", sig)
+	slog.Info("received signal, shutting down...", "signal", sig)
 
-	// Graceful shutdown
-	if configWatcher != nil {
-		configWatcher.Stop()
+	// Graceful shutdown with timeout
+	done := make(chan struct{})
+	go func() {
+		if configWatcher != nil {
+			configWatcher.Stop()
+		}
+		apiServer.Stop()
+		proxyServer.Stop()
+		hc.Stop()
+		pm.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		slog.Info("DBBouncer stopped")
+	case <-time.After(shutdownTimeout):
+		slog.Error("shutdown timed out, forcing exit", "timeout", shutdownTimeout)
+		os.Exit(1)
 	}
-	apiServer.Stop()
-	proxyServer.Stop()
-	hc.Stop()
-	pm.Close()
-
-	log.Printf("DBBouncer stopped")
 }

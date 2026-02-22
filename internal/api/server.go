@@ -204,6 +204,10 @@ func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "tenant id is required")
 		return
 	}
+	if err := config.ValidateTenantID(req.ID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if req.DBType != "postgres" && req.DBType != "mysql" {
 		writeError(w, http.StatusBadRequest, "db_type must be postgres or mysql")
 		return

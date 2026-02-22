@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/dbbouncer/dbbouncer/internal/config"
 	"github.com/dbbouncer/dbbouncer/internal/health"
@@ -48,15 +50,17 @@ func NewServer(r *router.Router, pm *pool.Manager, hc *health.Checker, m *metric
 	}
 
 	if lc.TLSEnabled() {
-		cert, err := tls.LoadX509KeyPair(lc.TLSCert, lc.TLSKey)
+		// Verify the cert/key can be loaded initially
+		_, err := tls.LoadX509KeyPair(lc.TLSCert, lc.TLSKey)
 		if err != nil {
 			slog.Warn("failed to load TLS cert/key — TLS disabled", "err", err)
 		} else {
+			loader := newCertLoader(lc.TLSCert, lc.TLSKey)
 			s.tlsConfig = &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS12,
+				GetCertificate: loader.getCertificate,
+				MinVersion:     tls.VersionTLS12,
 			}
-			slog.Info("TLS enabled", "cert", lc.TLSCert)
+			slog.Info("TLS enabled with hot-reload", "cert", lc.TLSCert)
 		}
 	}
 
@@ -114,10 +118,17 @@ func (s *Server) acceptLoop(ln net.Listener, dbType string) {
 			}
 		}
 
+		// Enable TCP keepalives on client connections
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetKeepAlive(true)
+			tc.SetKeepAlivePeriod(30 * time.Second)
+		}
+
 		// Enforce global connection limit
 		if s.maxConns > 0 && s.activeConns.Load() >= int64(s.maxConns) {
 			slog.Warn("connection limit reached, rejecting",
 				"limit", s.maxConns, "db_type", dbType, "remote_addr", conn.RemoteAddr())
+			sendConnectionLimitError(conn, dbType)
 			conn.Close()
 			continue
 		}
@@ -159,6 +170,82 @@ func (s *Server) handleConnection(clientConn net.Conn, dbType string) {
 
 	if err := handler.Handle(s.ctx, clientConn); err != nil {
 		slog.Error("connection error", "db_type", dbType, "err", err)
+	}
+}
+
+// certLoader provides TLS certificate hot-reload by checking file modification
+// times and reloading the cert/key pair when they change.
+type certLoader struct {
+	certPath string
+	keyPath  string
+	mu       sync.Mutex
+	cert     *tls.Certificate
+	modTime  time.Time
+}
+
+func newCertLoader(certPath, keyPath string) *certLoader {
+	cl := &certLoader{certPath: certPath, keyPath: keyPath}
+	// Load initial certificate
+	cl.loadLocked()
+	return cl
+}
+
+func (cl *certLoader) loadLocked() {
+	cert, err := tls.LoadX509KeyPair(cl.certPath, cl.keyPath)
+	if err != nil {
+		slog.Error("failed to reload TLS certificate", "err", err)
+		return
+	}
+	cl.cert = &cert
+	if info, err := os.Stat(cl.certPath); err == nil {
+		cl.modTime = info.ModTime()
+	}
+	slog.Info("TLS certificate loaded", "cert", cl.certPath)
+}
+
+func (cl *certLoader) getCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+
+	// Check if cert file has been modified
+	if info, err := os.Stat(cl.certPath); err == nil {
+		if info.ModTime().After(cl.modTime) {
+			cl.loadLocked()
+		}
+	}
+
+	return cl.cert, nil
+}
+
+// sendConnectionLimitError sends a protocol-appropriate error to the client
+// before closing the connection when the global limit is reached.
+func sendConnectionLimitError(conn net.Conn, dbType string) {
+	conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+	switch dbType {
+	case "postgres":
+		// PG ErrorResponse: severity=FATAL, code=53300 (too_many_connections), message
+		var buf []byte
+		buf = append(buf, 'S')
+		buf = append(buf, "FATAL"...)
+		buf = append(buf, 0)
+		buf = append(buf, 'C')
+		buf = append(buf, "53300"...)
+		buf = append(buf, 0)
+		buf = append(buf, 'M')
+		buf = append(buf, "too many connections"...)
+		buf = append(buf, 0)
+		buf = append(buf, 0) // terminator
+		writePGMessage(conn, pgMsgErrorResponse, buf)
+	case "mysql":
+		// MySQL ERR_Packet at sequence 0 (before handshake)
+		var buf []byte
+		buf = append(buf, mysqlErrPacket)
+		errCode := uint16(1040) // ER_CON_COUNT_ERROR
+		buf = append(buf, byte(errCode), byte(errCode>>8))
+		buf = append(buf, '#')
+		buf = append(buf, "08004"...)
+		buf = append(buf, "Too many connections"...)
+		writeMySQLPacket(conn, buf, 0)
 	}
 }
 

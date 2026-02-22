@@ -15,9 +15,17 @@ import (
 
 // Config is the top-level configuration for DBBouncer.
 type Config struct {
-	Listen   ListenConfig            `yaml:"listen"`
-	Defaults PoolDefaults            `yaml:"defaults"`
-	Tenants  map[string]TenantConfig `yaml:"tenants"`
+	Listen      ListenConfig            `yaml:"listen"`
+	Defaults    PoolDefaults            `yaml:"defaults"`
+	HealthCheck HealthCheckConfig       `yaml:"health_check"`
+	Tenants     map[string]TenantConfig `yaml:"tenants"`
+}
+
+// HealthCheckConfig defines health check behavior.
+type HealthCheckConfig struct {
+	Interval          time.Duration `yaml:"interval"`
+	FailureThreshold  int           `yaml:"failure_threshold"`
+	ConnectionTimeout time.Duration `yaml:"connection_timeout"`
 }
 
 // ListenConfig defines the ports and bind addresses DBBouncer listens on.
@@ -199,6 +207,15 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Listen.MaxProxyConnections == 0 {
 		cfg.Listen.MaxProxyConnections = 10000
+	}
+	if cfg.HealthCheck.Interval == 0 {
+		cfg.HealthCheck.Interval = 30 * time.Second
+	}
+	if cfg.HealthCheck.FailureThreshold == 0 {
+		cfg.HealthCheck.FailureThreshold = 3
+	}
+	if cfg.HealthCheck.ConnectionTimeout == 0 {
+		cfg.HealthCheck.ConnectionTimeout = 5 * time.Second
 	}
 }
 
