@@ -1,0 +1,144 @@
+<mxfile host="app.diagrams.net" modified="2026-02-22T00:00:00.000Z" agent="antigravity" version="21.0.0" type="device">
+  <diagram id="diagram_flow" name="Connection Flow">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="1200" background="#ffffff" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        
+        <!-- Nodes -->
+        <mxCell id="start" value="Start&#10;(Client Connects)" style="ellipse;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="120" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="extract_tenant" value="Proxy extracts Tenant ID&#10;(from PG startup options&#10;or MySQL username)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="360" y="140" width="200" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="check_tenant" value="Is Tenant Valid?&#10;(Router lookup)" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="380" y="240" width="160" height="80" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="auth_error" value="Return Auth Error" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="640" y="250" width="120" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="req_conn" value="Proxy requests connection&#10;for Tenant from Pool Manager" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="360" y="360" width="200" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="check_idle" value="Idle Connection&#10;Available?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="380" y="460" width="160" height="80" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="max_conn_check" value="Max Connections&#10;Reached?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="580" y="460" width="160" height="80" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="wait_conn" value="Wait in Queue&#10;(Timeout possible)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="510" y="580" width="120" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="dial_db" value="Dial Tenant Database&#10;(Create new connection)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="690" y="580" width="140" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="use_conn" value="Proxy Relays Packets&#10;(Client &lt;-&gt; Tenant DB)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="360" y="720" width="200" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="disconnect" value="Client Disconnects" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="360" y="820" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="release_conn" value="Proxy releases connection&#10;back to Pool Manager" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="360" y="920" width="200" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="end" value="End" style="ellipse;whiteSpace=wrap;html=1;fillColor=#eeeeee;strokeColor=#36393d;" vertex="1" parent="1">
+          <mxGeometry x="410" y="1020" width="100" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e_start_ext" edge="1" parent="1" source="start" target="extract_tenant" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="e_ext_chk" edge="1" parent="1" source="extract_tenant" target="check_tenant" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="e_chk_req" edge="1" parent="1" source="check_tenant" target="req_conn" value="Yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;verticalAlign=bottom;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="e_chk_err" edge="1" parent="1" source="check_tenant" target="auth_error" value="No" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;verticalAlign=bottom;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_err_end" edge="1" parent="1" source="auth_error" target="end" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="840" y="280" />
+              <mxPoint x="840" y="1045" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_req_chk_idle" edge="1" parent="1" source="req_conn" target="check_idle" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="e_idle_use" edge="1" parent="1" source="check_idle" target="use_conn" value="Yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;verticalAlign=bottom;">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="280" y="500" />
+              <mxPoint x="280" y="750" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        
+        <mxCell id="e_idle_max" edge="1" parent="1" source="check_idle" target="max_conn_check" value="No" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;verticalAlign=bottom;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_max_wait" edge="1" parent="1" source="max_conn_check" target="wait_conn" value="Yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;verticalAlign=bottom;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="e_max_dial" edge="1" parent="1" source="max_conn_check" target="dial_db" value="No" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;verticalAlign=bottom;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_wait_use" edge="1" parent="1" source="wait_conn" target="use_conn" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="570" y="680" />
+              <mxPoint x="460" y="680" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        
+        <mxCell id="e_dial_use" edge="1" parent="1" source="dial_db" target="use_conn" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="760" y="680" />
+              <mxPoint x="460" y="680" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_use_disc" edge="1" parent="1" source="use_conn" target="disconnect" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="e_disc_rel" edge="1" parent="1" source="disconnect" target="release_conn" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="e_rel_end" edge="1" parent="1" source="release_conn" target="end" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

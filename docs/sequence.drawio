@@ -1,0 +1,258 @@
+<mxfile host="app.diagrams.net" modified="2026-02-22T00:00:00.000Z" agent="antigravity" version="21.0.0" type="device">
+  <diagram id="diagram_seq" name="Connection Sequence">
+    <mxGraphModel dx="1200" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="1200" background="#ffffff" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        
+        <!-- Lifelines -->
+        <mxCell id="c" value="App Client" style="shape=umlLifeline;perimeter=lifelinePerimeter;whiteSpace=wrap;html=1;container=1;collapsible=0;recursiveResize=0;outlineConnect=0;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="100" y="80" width="100" height="900" as="geometry" />
+        </mxCell>
+        <mxCell id="c_act" value="" style="html=1;points=[];perimeter=orthogonalPerimeter;" vertex="1" parent="c">
+          <mxGeometry x="45" y="80" width="10" height="780" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p" value="DBBouncer Proxy" style="shape=umlLifeline;perimeter=lifelinePerimeter;whiteSpace=wrap;html=1;container=1;collapsible=0;recursiveResize=0;outlineConnect=0;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="300" y="80" width="120" height="900" as="geometry" />
+        </mxCell>
+        <mxCell id="p_act" value="" style="html=1;points=[];perimeter=orthogonalPerimeter;" vertex="1" parent="p">
+          <mxGeometry x="55" y="80" width="10" height="780" as="geometry" />
+        </mxCell>
+
+        <mxCell id="r" value="Router" style="shape=umlLifeline;perimeter=lifelinePerimeter;whiteSpace=wrap;html=1;container=1;collapsible=0;recursiveResize=0;outlineConnect=0;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="500" y="80" width="100" height="900" as="geometry" />
+        </mxCell>
+        <mxCell id="r_act" value="" style="html=1;points=[];perimeter=orthogonalPerimeter;" vertex="1" parent="r">
+          <mxGeometry x="45" y="160" width="10" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="pm" value="Pool Manager" style="shape=umlLifeline;perimeter=lifelinePerimeter;whiteSpace=wrap;html=1;container=1;collapsible=0;recursiveResize=0;outlineConnect=0;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="700" y="80" width="100" height="900" as="geometry" />
+        </mxCell>
+        <mxCell id="pm_act" value="" style="html=1;points=[];perimeter=orthogonalPerimeter;" vertex="1" parent="pm">
+          <mxGeometry x="45" y="240" width="10" height="240" as="geometry" />
+        </mxCell>
+        <mxCell id="pm_act2" value="" style="html=1;points=[];perimeter=orthogonalPerimeter;" vertex="1" parent="pm">
+          <mxGeometry x="45" y="760" width="10" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="db" value="Tenant Database" style="shape=umlLifeline;perimeter=lifelinePerimeter;whiteSpace=wrap;html=1;container=1;collapsible=0;recursiveResize=0;outlineConnect=0;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="900" y="80" width="120" height="900" as="geometry" />
+        </mxCell>
+        <mxCell id="db_act" value="" style="html=1;points=[];perimeter=orthogonalPerimeter;" vertex="1" parent="db">
+          <mxGeometry x="55" y="320" width="10" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="db_act2" value="" style="html=1;points=[];perimeter=orthogonalPerimeter;" vertex="1" parent="db">
+          <mxGeometry x="55" y="560" width="10" height="120" as="geometry" />
+        </mxCell>
+
+
+        <!-- Messages -->
+        
+        <!-- Client to Proxy Connect -->
+        <mxCell id="m1" value="1. TCP Connection" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="c_act" target="p_act">
+          <mxGeometry x="0.0526" y="10" width="80" relative="1" as="geometry">
+            <mxPoint x="155" y="180" as="sourcePoint"/>
+            <mxPoint x="355" y="180" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="200" y="180" />
+            </Array>
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        
+        <!-- Proxy to Client Handshake/Startup -->
+        <mxCell id="m2" value="2. Send Startup Config (Tenant ID)" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="c_act" target="p_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="155" y="220" as="sourcePoint"/>
+            <mxPoint x="355" y="220" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="250" y="220" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Proxy to Router -->
+        <mxCell id="m3" value="3. GetTenant(tenantID)" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="p_act" target="r_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="365" y="250" as="sourcePoint"/>
+            <mxPoint x="545" y="250" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="450" y="250" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Router to Proxy -->
+        <mxCell id="m4" value="4. Return Tenant Config" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;" edge="1" parent="1" source="r_act" target="p_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="545" y="290" as="sourcePoint"/>
+            <mxPoint x="365" y="290" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="440" y="290" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Proxy to PoolManager -->
+        <mxCell id="m5" value="5. AcquireConnection(tenantID)" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="p_act" target="pm_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="365" y="340" as="sourcePoint"/>
+            <mxPoint x="745" y="340" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="500" y="340" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- PoolManager checks local state -->
+        <mxCell id="m6" value="6. Check Idle Pool" style="edgeStyle=orthogonalEdgeStyle;html=1;align=left;spacingLeft=2;endArrow=block;rounded=0;" edge="1" parent="1" source="pm_act" target="pm_act">
+          <mxGeometry x="0.0526" y="10" relative="1" as="geometry">
+            <mxPoint x="755" y="360" as="sourcePoint"/>
+            <Array as="points">
+              <mxPoint x="785" y="360" />
+              <mxPoint x="785" y="380" />
+            </Array>
+            <mxPoint x="755" y="380" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Alternate Box: If no Idle -->
+        <mxCell id="alt1" value="[If No Idle &amp; Max Not Reached]" style="shape=umlFrame;whiteSpace=wrap;html=1;width=180;height=30;boundedLbl=1;verticalAlign=middle;align=left;spacingLeft=5;fillColor=#eeeeee;strokeColor=#36393d;" vertex="1" parent="1">
+          <mxGeometry x="250" y="390" width="800" height="110" as="geometry" />
+        </mxCell>
+
+        <!-- PoolManager to DB -->
+        <mxCell id="m7" value="7. Dial() (create new TCP conn)" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="pm_act" target="db_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="755" y="420" as="sourcePoint"/>
+            <mxPoint x="955" y="420" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="830" y="420" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- DB to PoolManager -->
+        <mxCell id="m8" value="8. Connection established" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;" edge="1" parent="1" source="db_act" target="pm_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="955" y="480" as="sourcePoint"/>
+            <mxPoint x="755" y="480" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="840" y="480" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- PoolManager to Proxy -->
+        <mxCell id="m9" value="9. Return Ready Database Connection" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;" edge="1" parent="1" source="pm_act" target="p_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="745" y="520" as="sourcePoint"/>
+            <mxPoint x="365" y="520" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="550" y="520" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Proxy to Client -->
+        <mxCell id="m10" value="10. Ready for Query / Auth OK" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;" edge="1" parent="1" source="p_act" target="c_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="355" y="550" as="sourcePoint"/>
+            <mxPoint x="155" y="550" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="230" y="550" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Data Phase -->
+        <mxCell id="alt2" value="[Data Phase]" style="shape=umlFrame;whiteSpace=wrap;html=1;width=100;height=30;boundedLbl=1;verticalAlign=middle;align=left;spacingLeft=5;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="50" y="580" width="1000" height="200" as="geometry" />
+        </mxCell>
+
+        <!-- Client to Proxy -->
+        <mxCell id="m11" value="11. Execute Query / Packets" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="c_act" target="p_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="155" y="630" as="sourcePoint"/>
+            <mxPoint x="355" y="630" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="240" y="630" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Proxy to DB (Relay) -->
+        <mxCell id="m12" value="12. Relay Packets" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="p_act" target="db_act2">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="365" y="650" as="sourcePoint"/>
+            <mxPoint x="955" y="650" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="500" y="650" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- DB to Proxy (Relay Return) -->
+        <mxCell id="m13" value="13. DB Response" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="db_act2" target="p_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="955" y="690" as="sourcePoint"/>
+            <mxPoint x="365" y="690" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="500" y="690" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Proxy to Client -->
+        <mxCell id="m14" value="14. Relay Responses" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="p_act" target="c_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="355" y="730" as="sourcePoint"/>
+            <mxPoint x="155" y="730" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="260" y="730" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Teardown Phase -->
+        
+        <!-- Client to Proxy Disconnect -->
+        <mxCell id="m15" value="15. Client Disconnects" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="c_act" target="p_act">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="155" y="800" as="sourcePoint"/>
+            <mxPoint x="355" y="800" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="240" y="800" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Proxy to PoolManager Release -->
+        <mxCell id="m16" value="16. ReleaseConnection(tenantID, conn)" style="html=1;verticalAlign=bottom;endArrow=block;" edge="1" parent="1" source="p_act" target="pm_act2">
+          <mxGeometry width="80" relative="1" as="geometry">
+            <mxPoint x="365" y="860" as="sourcePoint"/>
+            <mxPoint x="745" y="860" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="500" y="860" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- PoolManager internal state -->
+        <mxCell id="m17" value="17. Return to Pool&#10;(or Close)" style="edgeStyle=orthogonalEdgeStyle;html=1;align=left;spacingLeft=2;endArrow=block;rounded=0;" edge="1" parent="1" source="pm_act2" target="pm_act2">
+          <mxGeometry x="0.0526" y="10" relative="1" as="geometry">
+            <mxPoint x="755" y="880" as="sourcePoint"/>
+            <Array as="points">
+              <mxPoint x="785" y="880" />
+              <mxPoint x="785" y="900" />
+            </Array>
+            <mxPoint x="755" y="900" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
