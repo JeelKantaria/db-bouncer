@@ -171,7 +171,7 @@ func readMySQLErrorFromConn(conn net.Conn) (string, error) {
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 
-	payload, err := readMySQLPacket(conn)
+	payload, _, err := readMySQLPacket(conn)
 	if err != nil {
 		return "", err
 	}
@@ -453,7 +453,7 @@ func TestMySQLSyntheticHandshake(t *testing.T) {
 
 	// Read the handshake on the client side
 	client.SetReadDeadline(time.Now().Add(2 * time.Second))
-	payload, err := readMySQLPacket(client)
+	payload, _, err := readMySQLPacket(client)
 	if err != nil {
 		t.Fatalf("reading synthetic handshake: %v", err)
 	}
@@ -555,7 +555,7 @@ func TestMySQLNoTenant(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		// Read synthetic handshake first
-		readMySQLPacket(client)
+		_, _, _ = readMySQLPacket(client)
 		// Send response with no tenant info
 		resp := buildMySQLHandshakeResponse("plainuser", "unknowndb")
 		client.Write(resp)
@@ -587,7 +587,7 @@ func TestMySQLPausedTenant(t *testing.T) {
 	errCh := make(chan struct{}, 1)
 	go func() {
 		// Read synthetic handshake
-		readMySQLPacket(client)
+		_, _, _ = readMySQLPacket(client)
 		// Send response with tenant__user format
 		resp := buildMySQLHandshakeResponse("tenant_2__appuser", "")
 		client.Write(resp)
@@ -626,7 +626,7 @@ func TestMySQLUnknownTenant(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		// Read synthetic handshake
-		readMySQLPacket(client)
+		_, _, _ = readMySQLPacket(client)
 		// Send response with unknown tenant
 		resp := buildMySQLHandshakeResponse("unknown__appuser", "")
 		client.Write(resp)
@@ -679,7 +679,7 @@ func TestMySQLPacketRoundTrip(t *testing.T) {
 	}()
 
 	server.SetReadDeadline(time.Now().Add(2 * time.Second))
-	received, err := readMySQLPacket(server)
+	received, _, err := readMySQLPacket(server)
 	if err != nil {
 		t.Fatalf("readMySQLPacket error: %v", err)
 	}
@@ -730,7 +730,7 @@ func TestMySQLSendErrorFormat(t *testing.T) {
 	defer server.Close()
 
 	go func() {
-		h.sendMySQLError(server, 1045, "28000", "access denied")
+		h.sendMySQLError(server, 1045, "28000", "access denied", 2)
 		server.Close()
 	}()
 
@@ -795,7 +795,7 @@ func TestMySQLRandomNonce(t *testing.T) {
 		}()
 
 		client.SetReadDeadline(time.Now().Add(2 * time.Second))
-		payload, err := readMySQLPacket(client)
+		payload, _, err := readMySQLPacket(client)
 		if err != nil {
 			t.Fatalf("reading handshake: %v", err)
 		}

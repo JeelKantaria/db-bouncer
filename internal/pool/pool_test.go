@@ -2,6 +2,7 @@ package pool
 
 import (
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -209,5 +210,120 @@ func TestManagerTenantStats(t *testing.T) {
 	}
 	if stats.TenantID != "tenant_1" {
 		t.Errorf("expected tenant_1, got %s", stats.TenantID)
+	}
+}
+
+// --- Phase 2: Concurrency & correctness tests ---
+
+func TestPingDetectsClosedConnection(t *testing.T) {
+	client, server := net.Pipe()
+	pc := NewPooledConn(client, "test", "postgres", nil)
+
+	// Close the other end — Ping should detect the dead connection
+	server.Close()
+
+	err := pc.Ping()
+	if err == nil {
+		t.Error("Ping should return error for closed connection")
+	}
+	pc.Close()
+}
+
+func TestPingHealthyConnection(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewPooledConn(client, "test", "postgres", nil)
+	defer pc.Close()
+
+	// Healthy connection: Ping should return nil (timeout = healthy)
+	err := pc.Ping()
+	if err != nil {
+		t.Errorf("Ping should return nil for healthy connection, got: %v", err)
+	}
+}
+
+func TestDoubleCloseTenantPool(t *testing.T) {
+	tc := config.TenantConfig{
+		DBType: "postgres", Host: "localhost", Port: 5432,
+		DBName: "testdb", Username: "user",
+	}
+
+	tp := NewTenantPool("test", tc, testDefaults())
+
+	// Should not panic
+	tp.Close()
+	tp.Close()
+}
+
+func TestDoubleCloseManager(t *testing.T) {
+	m := NewManager(testDefaults())
+
+	// Should not panic
+	m.Close()
+	m.Close()
+}
+
+func TestConcurrentAcquireReturn(t *testing.T) {
+	// Create a pool that uses net.Pipe connections
+	tc := config.TenantConfig{
+		DBType: "postgres", Host: "localhost", Port: 15432,
+		DBName: "testdb", Username: "user",
+	}
+
+	defaults := config.PoolDefaults{
+		MinConnections: 0,
+		MaxConnections: 2,
+		IdleTimeout:    5 * time.Minute,
+		MaxLifetime:    30 * time.Minute,
+		AcquireTimeout: 2 * time.Second,
+	}
+
+	tp := NewTenantPool("concurrent_test", tc, defaults)
+	defer tp.Close()
+
+	// Inject mock connections manually by manipulating idle list
+	var pipes []net.Conn
+	for i := 0; i < 2; i++ {
+		client, server := net.Pipe()
+		pipes = append(pipes, client, server)
+		pc := NewPooledConn(client, "concurrent_test", "postgres", tp)
+		tp.mu.Lock()
+		tp.idle = append(tp.idle, pc)
+		tp.total++
+		tp.mu.Unlock()
+	}
+	defer func() {
+		for _, p := range pipes {
+			p.Close()
+		}
+	}()
+
+	// Run concurrent acquire/return cycles
+	var wg sync.WaitGroup
+	const goroutines = 10
+	const iterations = 5
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				pc, err := tp.Acquire()
+				if err != nil {
+					continue // pool may be exhausted, that's OK
+				}
+				// Simulate brief usage
+				time.Sleep(time.Millisecond)
+				tp.Return(pc)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Verify pool is in a consistent state
+	stats := tp.Stats()
+	if stats.Active != 0 {
+		t.Errorf("expected 0 active after all returns, got %d", stats.Active)
 	}
 }

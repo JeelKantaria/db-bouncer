@@ -51,8 +51,9 @@ type Checker struct {
 	failureThreshold  int
 	connectionTimeout time.Duration
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 // NewChecker creates a new health checker.
@@ -78,9 +79,11 @@ func (c *Checker) Start() {
 	log.Printf("[health] checker started (interval=%s, threshold=%d)", c.interval, c.failureThreshold)
 }
 
-// Stop stops the health checker.
+// Stop stops the health checker. Safe to call multiple times.
 func (c *Checker) Stop() {
-	close(c.stopCh)
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+	})
 	c.wg.Wait()
 	log.Printf("[health] checker stopped")
 }

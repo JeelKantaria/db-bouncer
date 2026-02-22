@@ -64,8 +64,12 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 	_ = database
 	_ = clientFlags
 
+	// After synthetic handshake (seq 0) and client response (seq 1),
+	// our error responses should use seq 2.
+	const errSeq byte = 2
+
 	if tenantID == "" {
-		h.sendMySQLError(clientConn, 1045, "28000", "no tenant_id provided (use tenant__user format or set database to tenant_id)")
+		h.sendMySQLError(clientConn, 1045, "28000", "no tenant_id provided (use tenant__user format or set database to tenant_id)", errSeq)
 		return fmt.Errorf("no tenant_id in MySQL connection")
 	}
 
@@ -74,19 +78,19 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 	// Resolve tenant config
 	tc, err := h.router.Resolve(tenantID)
 	if err != nil {
-		h.sendMySQLError(clientConn, 1045, "28000", fmt.Sprintf("unknown tenant: %s", tenantID))
+		h.sendMySQLError(clientConn, 1045, "28000", fmt.Sprintf("unknown tenant: %s", tenantID), errSeq)
 		return err
 	}
 
 	// Check if tenant is paused
 	if h.router.IsPaused(tenantID) {
-		h.sendMySQLError(clientConn, 1045, "08S01", fmt.Sprintf("tenant %s is paused", tenantID))
+		h.sendMySQLError(clientConn, 1045, "08S01", fmt.Sprintf("tenant %s is paused", tenantID), errSeq)
 		return fmt.Errorf("tenant %s is paused", tenantID)
 	}
 
 	// Check health
 	if h.healthCheck != nil && !h.healthCheck.IsHealthy(tenantID) {
-		h.sendMySQLError(clientConn, 1045, "08S01", fmt.Sprintf("tenant %s database is unhealthy", tenantID))
+		h.sendMySQLError(clientConn, 1045, "08S01", fmt.Sprintf("tenant %s database is unhealthy", tenantID), errSeq)
 		return fmt.Errorf("tenant %s is unhealthy", tenantID)
 	}
 
@@ -94,10 +98,12 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 	tenantPool := h.poolMgr.GetOrCreate(tenantID, tc)
 	pc, err := tenantPool.Acquire()
 	if err != nil {
-		h.sendMySQLError(clientConn, 1045, "08S01", fmt.Sprintf("cannot connect to database: %s", err))
+		h.sendMySQLError(clientConn, 1045, "08S01", fmt.Sprintf("cannot connect to database: %s", err), errSeq)
 		return err
 	}
-	defer pc.Return()
+	// Always close the backend connection after relay — the protocol state
+	// is unknown after bidirectional copy, so it cannot be safely reused.
+	defer pc.Close()
 
 	backendConn := pc.Conn()
 
@@ -107,7 +113,7 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 	}
 
 	// Read the real server's handshake
-	_, err = readMySQLPacket(backendConn)
+	_, _, err = readMySQLPacket(backendConn)
 	if err != nil {
 		return fmt.Errorf("reading backend handshake: %w", err)
 	}
@@ -117,14 +123,14 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 		return fmt.Errorf("forwarding handshake response to backend: %w", err)
 	}
 
-	// Read backend's auth response
-	authResp, err := readMySQLPacket(backendConn)
+	// Read backend's auth response and its sequence number
+	authResp, authSeq, err := readMySQLPacket(backendConn)
 	if err != nil {
 		return fmt.Errorf("reading backend auth response: %w", err)
 	}
 
-	// Forward backend's auth response to client
-	if err := writeMySQLPacket(clientConn, authResp, 2); err != nil {
+	// Forward backend's auth response to client with correct sequence number
+	if err := writeMySQLPacket(clientConn, authResp, authSeq); err != nil {
 		return fmt.Errorf("forwarding auth response to client: %w", err)
 	}
 
@@ -308,25 +314,27 @@ func (h *MySQLHandler) readHandshakeResponse(conn net.Conn) (tenantID, username 
 }
 
 // readMySQLPacket reads a single MySQL packet (4-byte header + payload).
-func readMySQLPacket(conn net.Conn) ([]byte, error) {
+// Returns the payload and the sequence number from the header.
+func readMySQLPacket(conn net.Conn) ([]byte, byte, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	payloadLen := int(header[0]) | int(header[1])<<8 | int(header[2])<<16
+	seqNum := header[3]
 	if payloadLen > 1<<24 {
-		return nil, fmt.Errorf("mysql packet too large: %d", payloadLen)
+		return nil, 0, fmt.Errorf("mysql packet too large: %d", payloadLen)
 	}
 
 	payload := make([]byte, payloadLen)
 	if payloadLen > 0 {
 		if _, err := io.ReadFull(conn, payload); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 
-	return payload, nil
+	return payload, seqNum, nil
 }
 
 // writeMySQLPacket writes a MySQL packet with the given sequence number.
@@ -344,8 +352,8 @@ func writeMySQLPacket(conn net.Conn, payload []byte, seqNum byte) error {
 	return err
 }
 
-// sendMySQLError sends a MySQL ERR_Packet to the client.
-func (h *MySQLHandler) sendMySQLError(conn net.Conn, errorCode uint16, sqlState, message string) {
+// sendMySQLError sends a MySQL ERR_Packet to the client with the given sequence number.
+func (h *MySQLHandler) sendMySQLError(conn net.Conn, errorCode uint16, sqlState, message string, seqNum byte) {
 	var buf []byte
 
 	// ERR packet header
@@ -367,5 +375,5 @@ func (h *MySQLHandler) sendMySQLError(conn net.Conn, errorCode uint16, sqlState,
 	// Error message
 	buf = append(buf, message...)
 
-	writeMySQLPacket(conn, buf, 2)
+	writeMySQLPacket(conn, buf, seqNum)
 }

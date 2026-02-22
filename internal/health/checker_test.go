@@ -154,3 +154,12 @@ func TestStatusString(t *testing.T) {
 		}
 	}
 }
+
+func TestDoubleStop(t *testing.T) {
+	c := NewChecker(newTestRouter(), nil)
+	c.Start()
+
+	// Should not panic
+	c.Stop()
+	c.Stop()
+}

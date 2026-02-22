@@ -86,7 +86,9 @@ func (h *PostgresHandler) Handle(ctx context.Context, clientConn net.Conn) error
 		h.sendPGError(clientConn, "FATAL", "08000", fmt.Sprintf("cannot connect to database: %s", err))
 		return err
 	}
-	defer pc.Return()
+	// Always close the backend connection after relay — the protocol state
+	// is unknown after bidirectional copy, so it cannot be safely reused.
+	defer pc.Close()
 
 	backendConn := pc.Conn()
 

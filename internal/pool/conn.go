@@ -118,10 +118,12 @@ func (pc *PooledConn) Close() error {
 }
 
 // Ping performs a lightweight health check on the connection.
+// A 1-byte read with a short deadline is used. A timeout error means
+// the connection is alive (no data pending but not closed). Any other
+// error means the connection is dead.
 func (pc *PooledConn) Ping() error {
-	// Set a short deadline and try a zero-byte read to detect closed connections
 	pc.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	buf := make([]byte, 0)
+	buf := make([]byte, 1)
 	_, err := pc.conn.Read(buf)
 	pc.conn.SetReadDeadline(time.Time{}) // Clear deadline
 	if err != nil {
@@ -131,6 +133,7 @@ func (pc *PooledConn) Ping() error {
 		}
 		return err
 	}
+	// If we actually read a byte, the connection is alive (unexpected data, but not dead)
 	return nil
 }
 

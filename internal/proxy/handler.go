@@ -13,7 +13,8 @@ type ConnectionHandler interface {
 }
 
 // relay copies data bidirectionally between client and backend connections.
-// It returns when either side closes or an error occurs.
+// It returns when either side closes, an error occurs, or the context is cancelled.
+// Both connections are closed on exit to ensure neither goroutine leaks.
 func relay(ctx context.Context, client, backend net.Conn) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
@@ -42,17 +43,22 @@ func relay(ctx context.Context, client, backend net.Conn) error {
 		}
 	}()
 
+	var firstErr error
+
 	// Wait for context cancellation or one side to finish
 	select {
 	case <-ctx.Done():
-		client.Close()
-		backend.Close()
 	case err := <-errCh:
 		if err != nil && err != io.EOF {
-			return err
+			firstErr = err
 		}
 	}
 
+	// Always close both connections to unblock the other goroutine,
+	// then wait for both to exit. This prevents goroutine leaks.
+	client.Close()
+	backend.Close()
 	wg.Wait()
-	return nil
+
+	return firstErr
 }

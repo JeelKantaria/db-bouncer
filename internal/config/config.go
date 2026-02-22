@@ -201,6 +201,7 @@ type Watcher struct {
 	watcher  *fsnotify.Watcher
 	mu       sync.Mutex
 	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewWatcher creates a new config file watcher.
@@ -268,8 +269,10 @@ func (cw *Watcher) reload() {
 	cw.callback(cfg)
 }
 
-// Stop stops the config watcher.
+// Stop stops the config watcher. Safe to call multiple times.
 func (cw *Watcher) Stop() error {
-	close(cw.stopCh)
+	cw.stopOnce.Do(func() {
+		close(cw.stopCh)
+	})
 	return cw.watcher.Close()
 }

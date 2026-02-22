@@ -29,6 +29,7 @@ type OnPoolExhausted func(tenantID string)
 // TenantPool manages connections for a single tenant.
 type TenantPool struct {
 	mu             sync.Mutex
+	cond           *sync.Cond // broadcast when a connection is returned
 	tenantID       string
 	dbType         string
 	host           string
@@ -47,7 +48,6 @@ type TenantPool struct {
 	total     int
 	waiting   int
 	exhausted int64
-	waitCh    chan struct{} // signaled when a connection is returned
 
 	closed          bool
 	stopCh          chan struct{}
@@ -71,9 +71,9 @@ func NewTenantPool(tenantID string, tc config.TenantConfig, defaults config.Pool
 		acquireTimeout: tc.EffectiveAcquireTimeout(defaults),
 		idle:           make([]*PooledConn, 0),
 		active:         make(map[*PooledConn]struct{}),
-		waitCh:         make(chan struct{}, 1),
 		stopCh:         make(chan struct{}),
 	}
+	tp.cond = sync.NewCond(&tp.mu)
 
 	// Start idle reaper
 	go tp.reapLoop()
@@ -83,10 +83,10 @@ func NewTenantPool(tenantID string, tc config.TenantConfig, defaults config.Pool
 
 // Acquire gets a connection from the pool, creating one if needed.
 func (tp *TenantPool) Acquire() (*PooledConn, error) {
-	deadline := time.After(tp.acquireTimeout)
+	deadlineAt := time.Now().Add(tp.acquireTimeout)
 
+	tp.mu.Lock()
 	for {
-		tp.mu.Lock()
 		if tp.closed {
 			tp.mu.Unlock()
 			return nil, fmt.Errorf("pool closed for tenant %s", tp.tenantID)
@@ -147,23 +147,35 @@ func (tp *TenantPool) Acquire() (*PooledConn, error) {
 			cb(tp.tenantID)
 		}
 
-		select {
-		case <-tp.waitCh:
-			tp.mu.Lock()
-			tp.waiting--
-			tp.mu.Unlock()
-			continue // retry
-		case <-deadline:
-			tp.mu.Lock()
+		// Wait with timeout using sync.Cond
+		tp.mu.Lock()
+		remaining := time.Until(deadlineAt)
+		if remaining <= 0 {
 			tp.waiting--
 			tp.mu.Unlock()
 			return nil, fmt.Errorf("acquire timeout (%s) for tenant %s: pool exhausted", tp.acquireTimeout, tp.tenantID)
-		case <-tp.stopCh:
-			tp.mu.Lock()
-			tp.waiting--
+		}
+
+		// Set up a timer to wake us if we time out
+		timer := time.AfterFunc(remaining, func() {
+			tp.cond.Broadcast()
+		})
+		tp.cond.Wait() // releases mu, waits for signal, reacquires mu
+		timer.Stop()
+
+		tp.waiting--
+
+		if tp.closed {
 			tp.mu.Unlock()
 			return nil, fmt.Errorf("pool closing for tenant %s", tp.tenantID)
 		}
+
+		if time.Now().After(deadlineAt) {
+			tp.mu.Unlock()
+			return nil, fmt.Errorf("acquire timeout (%s) for tenant %s: pool exhausted", tp.acquireTimeout, tp.tenantID)
+		}
+
+		// Retry from the top of the loop (mu is held)
 	}
 }
 
@@ -177,17 +189,15 @@ func (tp *TenantPool) Return(pc *PooledConn) {
 	if tp.closed || pc.IsExpired(tp.maxLifetime) {
 		pc.Close()
 		tp.total--
+		tp.cond.Broadcast()
 		return
 	}
 
 	pc.MarkIdle()
 	tp.idle = append(tp.idle, pc)
 
-	// Signal waiting goroutines
-	select {
-	case tp.waitCh <- struct{}{}:
-	default:
-	}
+	// Wake all waiting goroutines so they can retry
+	tp.cond.Broadcast()
 }
 
 // Stats returns current pool statistics.
@@ -262,6 +272,7 @@ func (tp *TenantPool) Close() {
 	}
 	tp.closed = true
 	close(tp.stopCh)
+	tp.cond.Broadcast() // wake any goroutines waiting in Acquire
 	tp.mu.Unlock()
 
 	tp.Drain()
@@ -325,6 +336,7 @@ type Manager struct {
 	onPoolExhausted OnPoolExhausted
 	statsCallback   StatsCallback
 	statsStopCh     chan struct{}
+	closeOnce       sync.Once
 }
 
 // NewManager creates a new pool manager.
@@ -455,13 +467,11 @@ func (m *Manager) UpdateDefaults(defaults config.PoolDefaults) {
 	m.defaults = defaults
 }
 
-// Close shuts down all pools and stops the stats loop.
+// Close shuts down all pools and stops the stats loop. Safe to call multiple times.
 func (m *Manager) Close() {
-	select {
-	case <-m.statsStopCh:
-	default:
+	m.closeOnce.Do(func() {
 		close(m.statsStopCh)
-	}
+	})
 
 	m.mu.Lock()
 	pools := m.pools
