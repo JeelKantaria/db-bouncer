@@ -2,7 +2,11 @@ package pool
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -15,6 +19,7 @@ import (
 type Stats struct {
 	TenantID  string `json:"tenant_id"`
 	DBType    string `json:"db_type"`
+	PoolMode  string `json:"pool_mode"`
 	Active    int    `json:"active"`
 	Idle      int    `json:"idle"`
 	Total     int    `json:"total"`
@@ -38,6 +43,7 @@ type TenantPool struct {
 	dbname         string
 	username       string
 	password       string
+	poolMode       string
 	minConns       int
 	maxConns       int
 	idleTimeout    time.Duration
@@ -66,6 +72,7 @@ func NewTenantPool(tenantID string, tc config.TenantConfig, defaults config.Pool
 		dbname:         tc.DBName,
 		username:       tc.Username,
 		password:       tc.Password,
+		poolMode:       tc.EffectivePoolMode(defaults),
 		minConns:       tc.EffectiveMinConnections(defaults),
 		maxConns:       tc.EffectiveMaxConnections(defaults),
 		idleTimeout:    tc.EffectiveIdleTimeout(defaults),
@@ -107,6 +114,18 @@ func (tp *TenantPool) warmUp() {
 			tp.mu.Unlock()
 			slog.Warn("warm-up connection failed", "index", i+1, "total", tp.minConns, "tenant", tp.tenantID, "err", err)
 			return
+		}
+
+		// For transaction-mode PG pools, authenticate during warm-up
+		if tp.poolMode == "transaction" && tp.dbType == "postgres" {
+			if err := tp.authenticatePG(pc); err != nil {
+				pc.Close()
+				tp.mu.Lock()
+				tp.total--
+				tp.mu.Unlock()
+				slog.Warn("warm-up PG auth failed", "index", i+1, "total", tp.minConns, "tenant", tp.tenantID, "err", err)
+				return
+			}
 		}
 
 		tp.mu.Lock()
@@ -159,11 +178,14 @@ func (tp *TenantPool) Acquire(ctx context.Context) (*PooledConn, error) {
 				continue
 			}
 
-			// Ping to verify connection is alive
-			if err := pc.Ping(); err != nil {
-				pc.Close()
-				tp.total--
-				continue
+			// Skip Ping for pre-authenticated connections — they have proper
+			// PG protocol state and Ping's 1-byte read would corrupt it.
+			if !pc.IsAuthenticated() {
+				if err := pc.Ping(); err != nil {
+					pc.Close()
+					tp.total--
+					continue
+				}
 			}
 
 			pc.MarkActive()
@@ -234,6 +256,17 @@ func (tp *TenantPool) Acquire(ctx context.Context) (*PooledConn, error) {
 	}
 }
 
+// InjectTestConn adds a pre-built PooledConn directly into the pool's idle list.
+// This is only intended for testing — it bypasses dial() and authentication.
+func (tp *TenantPool) InjectTestConn(pc *PooledConn) {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	pc.MarkIdle()
+	tp.idle = append(tp.idle, pc)
+	tp.total++
+	tp.cond.Signal()
+}
+
 // Return releases a connection back to the pool.
 func (tp *TenantPool) Return(pc *PooledConn) {
 	tp.mu.Lock()
@@ -265,6 +298,7 @@ func (tp *TenantPool) Stats() Stats {
 	return Stats{
 		TenantID:  tp.tenantID,
 		DBType:    tp.dbType,
+		PoolMode:  tp.poolMode,
 		Active:    len(tp.active),
 		Idle:      len(tp.idle),
 		Total:     tp.total,
@@ -345,7 +379,209 @@ func (tp *TenantPool) dial(ctx context.Context) (*PooledConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewPooledConn(conn, tp.tenantID, tp.dbType, tp), nil
+	pc := NewPooledConn(conn, tp.tenantID, tp.dbType, tp)
+
+	// For transaction-mode PG pools, authenticate during dial
+	if tp.poolMode == "transaction" && tp.dbType == "postgres" {
+		if err := tp.authenticatePG(pc); err != nil {
+			pc.Close()
+			return nil, fmt.Errorf("PG auth during dial: %w", err)
+		}
+	}
+
+	return pc, nil
+}
+
+// PoolMode returns the pool mode for this tenant pool.
+func (tp *TenantPool) PoolMode() string {
+	return tp.poolMode
+}
+
+// Password returns the configured password for the backend database.
+func (tp *TenantPool) Password() string {
+	return tp.password
+}
+
+// authenticatePG performs the PostgreSQL startup and authentication handshake
+// on a raw connection, producing a ready-to-query connection. It sends the
+// startup message, handles auth challenges, and collects ParameterStatus and
+// BackendKeyData. The connection is ready for queries when this returns nil.
+func (tp *TenantPool) authenticatePG(pc *PooledConn) error {
+	conn := pc.Conn()
+
+	// Build startup message: length(4) + protocol(4) + params + \0
+	var body []byte
+	// Protocol version 3.0
+	ver := make([]byte, 4)
+	binary.BigEndian.PutUint32(ver, 3<<16|0) // v3.0
+	body = append(body, ver...)
+
+	// user parameter
+	body = append(body, "user"...)
+	body = append(body, 0)
+	body = append(body, tp.username...)
+	body = append(body, 0)
+
+	// database parameter
+	body = append(body, "database"...)
+	body = append(body, 0)
+	body = append(body, tp.dbname...)
+	body = append(body, 0)
+
+	// terminator
+	body = append(body, 0)
+
+	// Prepend length
+	msgLen := make([]byte, 4)
+	binary.BigEndian.PutUint32(msgLen, uint32(4+len(body)))
+	startupMsg := append(msgLen, body...)
+
+	if _, err := conn.Write(startupMsg); err != nil {
+		return fmt.Errorf("sending startup message: %w", err)
+	}
+
+	// Read responses until ReadyForQuery
+	params := make(map[string]string)
+	var backendPID, backendKey uint32
+
+	for {
+		// Read message type (1 byte)
+		typeBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, typeBuf); err != nil {
+			return fmt.Errorf("reading message type: %w", err)
+		}
+		msgType := typeBuf[0]
+
+		// Read message length (4 bytes, includes itself)
+		lenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return fmt.Errorf("reading message length: %w", err)
+		}
+		payloadLen := int(binary.BigEndian.Uint32(lenBuf)) - 4
+		if payloadLen < 0 || payloadLen > 1<<24 {
+			return fmt.Errorf("invalid message length: %d", payloadLen)
+		}
+
+		payload := make([]byte, payloadLen)
+		if payloadLen > 0 {
+			if _, err := io.ReadFull(conn, payload); err != nil {
+				return fmt.Errorf("reading payload: %w", err)
+			}
+		}
+
+		switch msgType {
+		case 'R': // Authentication
+			if len(payload) < 4 {
+				return fmt.Errorf("authentication message too short")
+			}
+			authType := binary.BigEndian.Uint32(payload[:4])
+			switch authType {
+			case 0: // AuthenticationOk
+				continue
+			case 3: // AuthenticationCleartextPassword
+				if err := tp.sendPasswordMessage(conn, tp.password); err != nil {
+					return err
+				}
+			case 5: // AuthenticationMD5Password
+				if len(payload) < 8 {
+					return fmt.Errorf("MD5 auth message too short")
+				}
+				salt := payload[4:8]
+				md5Pass := computeMD5Password(tp.username, tp.password, salt)
+				if err := tp.sendPasswordMessage(conn, md5Pass); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("unsupported auth type: %d", authType)
+			}
+
+		case 'S': // ParameterStatus
+			// key\0value\0
+			key, val := parseNullTerminatedPair(payload)
+			if key != "" {
+				params[key] = val
+			}
+
+		case 'K': // BackendKeyData
+			if len(payload) >= 8 {
+				backendPID = binary.BigEndian.Uint32(payload[:4])
+				backendKey = binary.BigEndian.Uint32(payload[4:8])
+			}
+
+		case 'Z': // ReadyForQuery
+			if len(payload) >= 1 && payload[0] == 'I' {
+				pc.SetAuthenticated(params, backendPID, backendKey)
+				return nil
+			}
+			return fmt.Errorf("unexpected transaction status after auth: %c", payload[0])
+
+		case 'E': // ErrorResponse
+			errMsg := parseErrorMessage(payload)
+			return fmt.Errorf("backend error during auth: %s", errMsg)
+
+		default:
+			// Skip unknown messages during startup
+			continue
+		}
+	}
+}
+
+// sendPasswordMessage sends a PG password message ('p').
+func (tp *TenantPool) sendPasswordMessage(conn net.Conn, password string) error {
+	payload := append([]byte(password), 0)
+	msgLen := len(payload) + 4
+	buf := make([]byte, 1+4+len(payload))
+	buf[0] = 'p'
+	binary.BigEndian.PutUint32(buf[1:5], uint32(msgLen))
+	copy(buf[5:], payload)
+	_, err := conn.Write(buf)
+	return err
+}
+
+// parseNullTerminatedPair parses a "key\0value\0" buffer.
+func parseNullTerminatedPair(data []byte) (string, string) {
+	for i := 0; i < len(data); i++ {
+		if data[i] == 0 {
+			key := string(data[:i])
+			rest := data[i+1:]
+			for j := 0; j < len(rest); j++ {
+				if rest[j] == 0 {
+					return key, string(rest[:j])
+				}
+			}
+			return key, string(rest)
+		}
+	}
+	return "", ""
+}
+
+// parseErrorMessage extracts the message ('M') field from a PG ErrorResponse payload.
+func parseErrorMessage(payload []byte) string {
+	for i := 0; i < len(payload); i++ {
+		fieldType := payload[i]
+		if fieldType == 0 {
+			break
+		}
+		i++
+		end := i
+		for end < len(payload) && payload[end] != 0 {
+			end++
+		}
+		if fieldType == 'M' {
+			return string(payload[i:end])
+		}
+		i = end
+	}
+	return "unknown error"
+}
+
+// computeMD5Password computes the PostgreSQL MD5 password hash.
+// Formula: "md5" + md5(md5(password + user) + salt)
+func computeMD5Password(user, password string, salt []byte) string {
+	h1 := md5.Sum([]byte(password + user))
+	hex1 := hex.EncodeToString(h1[:])
+	h2 := md5.Sum(append([]byte(hex1), salt...))
+	return "md5" + hex.EncodeToString(h2[:])
 }
 
 func (tp *TenantPool) reapLoop() {

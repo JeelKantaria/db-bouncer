@@ -429,6 +429,7 @@ func (s *Server) configHandler(w http.ResponseWriter, r *http.Request) {
 			"idle_timeout":    defaults.IdleTimeout.String(),
 			"max_lifetime":    defaults.MaxLifetime.String(),
 			"acquire_timeout": defaults.AcquireTimeout.String(),
+			"pool_mode":       defaults.PoolMode,
 		},
 		"tenant_count": len(tenants),
 	})

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -349,6 +350,120 @@ tenants: {}
 	}
 	if cfg.Listen.MaxProxyConnections != 10000 {
 		t.Errorf("expected default max_proxy_connections 10000, got %d", cfg.Listen.MaxProxyConnections)
+	}
+}
+
+func TestPoolModeDefault(t *testing.T) {
+	yaml := `
+tenants: {}
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.Defaults.PoolMode != "session" {
+		t.Errorf("expected default pool_mode 'session', got %q", cfg.Defaults.PoolMode)
+	}
+}
+
+func TestPoolModeValidValues(t *testing.T) {
+	for _, mode := range []string{"session", "transaction"} {
+		t.Run(mode, func(t *testing.T) {
+			yaml := fmt.Sprintf(`
+defaults:
+  pool_mode: %s
+tenants: {}
+`, mode)
+			path := writeTemp(t, yaml)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load failed for pool_mode=%s: %v", mode, err)
+			}
+			if cfg.Defaults.PoolMode != mode {
+				t.Errorf("expected pool_mode %q, got %q", mode, cfg.Defaults.PoolMode)
+			}
+		})
+	}
+}
+
+func TestPoolModeInvalidValue(t *testing.T) {
+	yaml := `
+defaults:
+  pool_mode: statement
+tenants: {}
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error for invalid pool_mode 'statement'")
+	}
+}
+
+func TestTenantPoolModeOverride(t *testing.T) {
+	yaml := `
+defaults:
+  pool_mode: session
+tenants:
+  t1:
+    db_type: postgres
+    host: localhost
+    port: 5432
+    dbname: db
+    username: user
+    pool_mode: transaction
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	tc := cfg.Tenants["t1"]
+	if tc.EffectivePoolMode(cfg.Defaults) != "transaction" {
+		t.Error("expected tenant pool_mode override 'transaction'")
+	}
+}
+
+func TestTenantPoolModeInheritsDefault(t *testing.T) {
+	yaml := `
+defaults:
+  pool_mode: transaction
+tenants:
+  t1:
+    db_type: postgres
+    host: localhost
+    port: 5432
+    dbname: db
+    username: user
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	tc := cfg.Tenants["t1"]
+	if tc.EffectivePoolMode(cfg.Defaults) != "transaction" {
+		t.Error("expected tenant to inherit default pool_mode 'transaction'")
+	}
+}
+
+func TestTenantPoolModeInvalidValue(t *testing.T) {
+	yaml := `
+tenants:
+  t1:
+    db_type: postgres
+    host: localhost
+    port: 5432
+    dbname: db
+    username: user
+    pool_mode: statement
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error for invalid tenant pool_mode 'statement'")
 	}
 }
 

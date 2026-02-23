@@ -25,6 +25,12 @@ type PooledConn struct {
 	tenantID  string
 	dbType    string
 	pool      *TenantPool // back-reference for returning to pool
+
+	// Pre-authenticated state (transaction-mode PG connections)
+	authenticated bool
+	serverParams  map[string]string // cached ParameterStatus values from backend
+	backendPID    uint32            // from BackendKeyData
+	backendKey    uint32            // from BackendKeyData
 }
 
 // NewPooledConn wraps a net.Conn for pool management.
@@ -54,6 +60,34 @@ func (pc *PooledConn) TenantID() string {
 // DBType returns the database type (postgres or mysql).
 func (pc *PooledConn) DBType() string {
 	return pc.dbType
+}
+
+// IsAuthenticated returns whether this connection has completed PG startup/auth.
+func (pc *PooledConn) IsAuthenticated() bool {
+	return pc.authenticated
+}
+
+// ServerParams returns the cached ParameterStatus values from the PG backend.
+func (pc *PooledConn) ServerParams() map[string]string {
+	return pc.serverParams
+}
+
+// BackendPID returns the PG backend process ID.
+func (pc *PooledConn) BackendPID() uint32 {
+	return pc.backendPID
+}
+
+// BackendKey returns the PG backend secret key.
+func (pc *PooledConn) BackendKey() uint32 {
+	return pc.backendKey
+}
+
+// SetAuthenticated sets the pre-authenticated state on this connection.
+func (pc *PooledConn) SetAuthenticated(params map[string]string, pid, key uint32) {
+	pc.authenticated = true
+	pc.serverParams = params
+	pc.backendPID = pid
+	pc.backendKey = key
 }
 
 // MarkActive marks this connection as in-use.
