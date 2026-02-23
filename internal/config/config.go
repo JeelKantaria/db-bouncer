@@ -48,6 +48,7 @@ type PoolDefaults struct {
 	MaxLifetime    time.Duration `yaml:"max_lifetime"`
 	AcquireTimeout time.Duration `yaml:"acquire_timeout"`
 	DialTimeout    time.Duration `yaml:"dial_timeout"`
+	PoolMode       string        `yaml:"pool_mode"`
 }
 
 // TenantConfig holds the database configuration for a single tenant.
@@ -64,6 +65,7 @@ type TenantConfig struct {
 	MaxLifetime    *time.Duration `yaml:"max_lifetime,omitempty"`
 	AcquireTimeout *time.Duration `yaml:"acquire_timeout,omitempty"`
 	DialTimeout    *time.Duration `yaml:"dial_timeout,omitempty"`
+	PoolMode       *string        `yaml:"pool_mode,omitempty"`
 }
 
 // EffectiveMinConnections returns the tenant's min connections or the default.
@@ -112,6 +114,14 @@ func (t TenantConfig) EffectiveDialTimeout(defaults PoolDefaults) time.Duration 
 		return *t.DialTimeout
 	}
 	return defaults.DialTimeout
+}
+
+// EffectivePoolMode returns the tenant's pool mode or the default.
+func (t TenantConfig) EffectivePoolMode(defaults PoolDefaults) string {
+	if t.PoolMode != nil {
+		return *t.PoolMode
+	}
+	return defaults.PoolMode
 }
 
 // Redacted returns a copy of the TenantConfig with the password masked.
@@ -208,6 +218,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Listen.MaxProxyConnections == 0 {
 		cfg.Listen.MaxProxyConnections = 10000
 	}
+	if cfg.Defaults.PoolMode == "" {
+		cfg.Defaults.PoolMode = "session"
+	}
 	if cfg.HealthCheck.Interval == 0 {
 		cfg.HealthCheck.Interval = 30 * time.Second
 	}
@@ -232,6 +245,9 @@ func validate(cfg *Config) error {
 	}
 
 	// Validate default pool settings
+	if cfg.Defaults.PoolMode != "" && cfg.Defaults.PoolMode != "session" && cfg.Defaults.PoolMode != "transaction" {
+		return fmt.Errorf("defaults: pool_mode %q is invalid (must be \"session\" or \"transaction\")", cfg.Defaults.PoolMode)
+	}
 	if cfg.Defaults.MinConnections > cfg.Defaults.MaxConnections && cfg.Defaults.MaxConnections > 0 {
 		return fmt.Errorf("defaults: min_connections (%d) must not exceed max_connections (%d)",
 			cfg.Defaults.MinConnections, cfg.Defaults.MaxConnections)
@@ -260,6 +276,11 @@ func validate(cfg *Config) error {
 		}
 		if tenant.Username == "" {
 			return fmt.Errorf("tenant %q: username is required", id)
+		}
+
+		// Validate per-tenant pool_mode
+		if tenant.PoolMode != nil && *tenant.PoolMode != "session" && *tenant.PoolMode != "transaction" {
+			return fmt.Errorf("tenant %q: pool_mode %q is invalid (must be \"session\" or \"transaction\")", id, *tenant.PoolMode)
 		}
 
 		// Validate min <= max for per-tenant overrides

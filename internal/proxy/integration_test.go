@@ -869,3 +869,251 @@ func TestPGSSLMaxAttempts(t *testing.T) {
 		t.Fatal("expected error for too many SSL attempts")
 	}
 }
+
+// --- Transaction-Mode Integration Tests ---
+
+func testTxnConfig() *config.Config {
+	txnMode := "transaction"
+	return &config.Config{
+		Listen: config.ListenConfig{
+			PostgresPort: 6432,
+			MySQLPort:    3307,
+			APIPort:      8080,
+		},
+		Defaults: config.PoolDefaults{
+			MinConnections: 0,
+			MaxConnections: 10,
+			IdleTimeout:    5 * time.Minute,
+			MaxLifetime:    30 * time.Minute,
+			AcquireTimeout: 5 * time.Second,
+			PoolMode:       "transaction",
+		},
+		Tenants: map[string]config.TenantConfig{
+			"txn_tenant": {
+				DBType:   "postgres",
+				Host:     "localhost",
+				Port:     5432,
+				DBName:   "testdb",
+				Username: "testuser",
+				PoolMode: &txnMode,
+			},
+		},
+	}
+}
+
+func TestPGTransactionModeEndToEnd(t *testing.T) {
+	cfg := testTxnConfig()
+	r := router.New(cfg)
+	pm := pool.NewManager(cfg.Defaults)
+	defer pm.Close()
+
+	h := &PostgresHandler{router: r, poolMgr: pm, healthCheck: nil, metrics: nil}
+
+	// Create mock backend that will be injected into the pool
+	backendConn, backendEnd := net.Pipe()
+	defer backendConn.Close()
+	defer backendEnd.Close()
+
+	// Pre-create the pool and inject an authenticated connection
+	tc := cfg.Tenants["txn_tenant"]
+	tp := pm.GetOrCreate("txn_tenant", tc)
+	pc := pool.NewPooledConn(backendConn, "txn_tenant", "postgres", tp)
+	pc.SetAuthenticated(
+		map[string]string{"server_version": "15.0", "client_encoding": "UTF8"},
+		1234, 5678,
+	)
+	tp.InjectTestConn(pc)
+
+	// Create client connection
+	clientConn, clientEnd := net.Pipe()
+	defer clientConn.Close()
+	defer clientEnd.Close()
+
+	// Build startup message with tenant_id
+	startupMsg := buildPGStartupMessage(map[string]string{
+		"user":    "testuser",
+		"options": "-c tenant_id=txn_tenant",
+	})
+
+	var handleErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Write startup message first
+		clientEnd.Write(startupMsg)
+
+		// Read synthetic auth-ok sequence
+		clientEnd.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for {
+			msgType, payload, err := readPGMessage(clientEnd)
+			if err != nil {
+				return
+			}
+			if msgType == pgMsgReadyForQuery && len(payload) > 0 && payload[0] == 'I' {
+				break
+			}
+		}
+
+		// Send a query
+		writePGMessage(clientEnd, pgMsgQuery, append([]byte("SELECT 1"), 0))
+
+		// Read response
+		for {
+			msgType, payload, err := readPGMessage(clientEnd)
+			if err != nil {
+				return
+			}
+			if msgType == pgMsgReadyForQuery {
+				if len(payload) > 0 && payload[0] == 'I' {
+					break
+				}
+			}
+		}
+
+		// Terminate
+		writePGMessage(clientEnd, pgMsgTerminate, nil)
+		clientEnd.Close()
+	}()
+
+	// Backend goroutine: handle the query relay
+	go func() {
+		backendEnd.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+		// Read query from relay
+		msgType, _, err := readPGMessage(backendEnd)
+		if err != nil {
+			return
+		}
+		if msgType != pgMsgQuery {
+			return
+		}
+
+		// Send response
+		writePGMessage(backendEnd, 'C', append([]byte("SELECT 1"), 0))
+		writePGMessage(backendEnd, pgMsgReadyForQuery, []byte{'I'})
+
+		// Expect DISCARD ALL
+		backendEnd.SetReadDeadline(time.Now().Add(5 * time.Second))
+		msgType, _, err = readPGMessage(backendEnd)
+		if err != nil {
+			return
+		}
+		if msgType == pgMsgQuery {
+			writePGMessage(backendEnd, 'C', append([]byte("DISCARD ALL"), 0))
+			writePGMessage(backendEnd, pgMsgReadyForQuery, []byte{'I'})
+		}
+	}()
+
+	handleErr = h.Handle(context.Background(), clientConn)
+	<-done
+
+	if handleErr != nil {
+		t.Errorf("Handle returned error: %v", handleErr)
+	}
+}
+
+func TestPGTransactionModeConnectionReuse(t *testing.T) {
+	cfg := testTxnConfig()
+	r := router.New(cfg)
+	pm := pool.NewManager(cfg.Defaults)
+	defer pm.Close()
+
+	// Pre-create pool and inject one authenticated connection
+	tc := cfg.Tenants["txn_tenant"]
+	tp := pm.GetOrCreate("txn_tenant", tc)
+
+	backendConn, backendEnd := net.Pipe()
+	defer backendConn.Close()
+	defer backendEnd.Close()
+
+	pc := pool.NewPooledConn(backendConn, "txn_tenant", "postgres", tp)
+	pc.SetAuthenticated(
+		map[string]string{"server_version": "15.0"},
+		1234, 5678,
+	)
+	tp.InjectTestConn(pc)
+
+	// Verify only 1 connection in pool
+	stats := tp.Stats()
+	if stats.Total != 1 {
+		t.Fatalf("expected 1 total connection, got %d", stats.Total)
+	}
+
+	// First client session
+	clientConn1, clientEnd1 := net.Pipe()
+	defer clientConn1.Close()
+	defer clientEnd1.Close()
+
+	h := &PostgresHandler{router: r, poolMgr: pm, healthCheck: nil, metrics: nil}
+
+	startupMsg := buildPGStartupMessage(map[string]string{
+		"user":    "testuser",
+		"options": "-c tenant_id=txn_tenant",
+	})
+
+	// Run first client through Handle()
+	handleDone := make(chan error, 1)
+	go func() {
+		handleDone <- h.Handle(context.Background(), clientConn1)
+	}()
+
+	// Backend handler
+	go func() {
+		backendEnd.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for {
+			msgType, _, err := readPGMessage(backendEnd)
+			if err != nil {
+				return
+			}
+			if msgType == pgMsgQuery {
+				writePGMessage(backendEnd, 'C', append([]byte("OK"), 0))
+				writePGMessage(backendEnd, pgMsgReadyForQuery, []byte{'I'})
+			}
+		}
+	}()
+
+	// Client 1: write startup, read auth, send query, read response, terminate
+	clientEnd1.SetReadDeadline(time.Now().Add(5 * time.Second))
+	clientEnd1.Write(startupMsg)
+
+	// Drain auth
+	for {
+		msgType, payload, err := readPGMessage(clientEnd1)
+		if err != nil {
+			t.Fatalf("client1 read auth error: %v", err)
+		}
+		if msgType == pgMsgReadyForQuery && len(payload) > 0 && payload[0] == 'I' {
+			break
+		}
+	}
+
+	// Send query
+	writePGMessage(clientEnd1, pgMsgQuery, append([]byte("SELECT 1"), 0))
+
+	// Read response
+	for {
+		msgType, payload, err := readPGMessage(clientEnd1)
+		if err != nil {
+			t.Fatalf("client1 read response error: %v", err)
+		}
+		if msgType == pgMsgReadyForQuery && len(payload) > 0 && payload[0] == 'I' {
+			break
+		}
+	}
+
+	// Terminate first client
+	writePGMessage(clientEnd1, pgMsgTerminate, nil)
+	clientEnd1.Close()
+
+	err := <-handleDone
+	if err != nil {
+		t.Logf("first handle returned: %v", err)
+	}
+
+	// After first client disconnects, pool should still have 1 total connection (reused)
+	time.Sleep(100 * time.Millisecond) // allow pool return to settle
+	stats = tp.Stats()
+	if stats.Total != 1 {
+		t.Errorf("expected 1 total connection after first client (reused), got %d", stats.Total)
+	}
+}

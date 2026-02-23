@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"sync"
 	"testing"
@@ -445,4 +446,194 @@ func TestMetricsNewDoesNotPanic(t *testing.T) {
 	tp2 := NewTenantPool("t2", tc, testDefaults())
 	tp1.Close()
 	tp2.Close()
+}
+
+// --- Phase 3: authenticatePG tests ---
+
+// mockPGBackend simulates a PostgreSQL backend for testing authenticatePG.
+// It reads the startup message, sends AuthenticationOk, ParameterStatus,
+// BackendKeyData, and ReadyForQuery('I').
+func mockPGBackend(t *testing.T, conn net.Conn, wantAuth bool) {
+	t.Helper()
+
+	// Read startup message (length-prefixed, no message type byte)
+	lenBuf := make([]byte, 4)
+	if _, err := conn.Read(lenBuf); err != nil {
+		t.Errorf("mockPGBackend: reading startup length: %v", err)
+		return
+	}
+	msgLen := int(binary.BigEndian.Uint32(lenBuf))
+	body := make([]byte, msgLen-4)
+	if _, err := conn.Read(body); err != nil {
+		t.Errorf("mockPGBackend: reading startup body: %v", err)
+		return
+	}
+
+	if wantAuth {
+		// Send AuthenticationCleartextPassword (R, type=3)
+		writePGTestMsg(conn, 'R', uint32ToBE(3))
+
+		// Read password message from client
+		typeBuf := make([]byte, 1)
+		conn.Read(typeBuf) // 'p'
+		pLenBuf := make([]byte, 4)
+		conn.Read(pLenBuf)
+		pLen := int(binary.BigEndian.Uint32(pLenBuf)) - 4
+		pPayload := make([]byte, pLen)
+		conn.Read(pPayload)
+	}
+
+	// Send AuthenticationOk (R, type=0)
+	writePGTestMsg(conn, 'R', uint32ToBE(0))
+
+	// Send ParameterStatus: server_version = 15.0
+	writePGTestMsg(conn, 'S', nullTermPair("server_version", "15.0"))
+	writePGTestMsg(conn, 'S', nullTermPair("server_encoding", "UTF8"))
+
+	// Send BackendKeyData (pid=1234, key=5678)
+	bkd := make([]byte, 8)
+	binary.BigEndian.PutUint32(bkd[:4], 1234)
+	binary.BigEndian.PutUint32(bkd[4:], 5678)
+	writePGTestMsg(conn, 'K', bkd)
+
+	// Send ReadyForQuery('I')
+	writePGTestMsg(conn, 'Z', []byte{'I'})
+}
+
+func writePGTestMsg(conn net.Conn, msgType byte, payload []byte) {
+	msgLen := len(payload) + 4
+	buf := make([]byte, 1+4+len(payload))
+	buf[0] = msgType
+	binary.BigEndian.PutUint32(buf[1:5], uint32(msgLen))
+	copy(buf[5:], payload)
+	conn.Write(buf)
+}
+
+func uint32ToBE(v uint32) []byte {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, v)
+	return b
+}
+
+func nullTermPair(key, val string) []byte {
+	var buf []byte
+	buf = append(buf, key...)
+	buf = append(buf, 0)
+	buf = append(buf, val...)
+	buf = append(buf, 0)
+	return buf
+}
+
+func TestAuthenticatePGCleartextSuccess(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	tp := &TenantPool{
+		tenantID: "test",
+		dbType:   "postgres",
+		poolMode: "transaction",
+		username: "testuser",
+		password: "testpass",
+		dbname:   "testdb",
+	}
+
+	pc := NewPooledConn(client, "test", "postgres", tp)
+
+	go mockPGBackend(t, server, true)
+
+	err := tp.authenticatePG(pc)
+	if err != nil {
+		t.Fatalf("authenticatePG failed: %v", err)
+	}
+
+	if !pc.IsAuthenticated() {
+		t.Error("expected connection to be authenticated")
+	}
+	if pc.BackendPID() != 1234 {
+		t.Errorf("expected backendPID=1234, got %d", pc.BackendPID())
+	}
+	if pc.BackendKey() != 5678 {
+		t.Errorf("expected backendKey=5678, got %d", pc.BackendKey())
+	}
+	params := pc.ServerParams()
+	if params["server_version"] != "15.0" {
+		t.Errorf("expected server_version=15.0, got %q", params["server_version"])
+	}
+	if params["server_encoding"] != "UTF8" {
+		t.Errorf("expected server_encoding=UTF8, got %q", params["server_encoding"])
+	}
+}
+
+func TestAuthenticatePGNoAuthSuccess(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	tp := &TenantPool{
+		tenantID: "test",
+		dbType:   "postgres",
+		poolMode: "transaction",
+		username: "testuser",
+		password: "",
+		dbname:   "testdb",
+	}
+
+	pc := NewPooledConn(client, "test", "postgres", tp)
+
+	go mockPGBackend(t, server, false)
+
+	err := tp.authenticatePG(pc)
+	if err != nil {
+		t.Fatalf("authenticatePG failed: %v", err)
+	}
+
+	if !pc.IsAuthenticated() {
+		t.Error("expected connection to be authenticated")
+	}
+}
+
+func TestAuthenticatePGErrorResponse(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	tp := &TenantPool{
+		tenantID: "test",
+		dbType:   "postgres",
+		poolMode: "transaction",
+		username: "baduser",
+		password: "badpass",
+		dbname:   "testdb",
+	}
+
+	pc := NewPooledConn(client, "test", "postgres", tp)
+
+	go func() {
+		// Read startup message
+		lenBuf := make([]byte, 4)
+		server.Read(lenBuf)
+		msgLen := int(binary.BigEndian.Uint32(lenBuf))
+		body := make([]byte, msgLen-4)
+		server.Read(body)
+
+		// Send ErrorResponse
+		var errPayload []byte
+		errPayload = append(errPayload, 'S')
+		errPayload = append(errPayload, "FATAL"...)
+		errPayload = append(errPayload, 0)
+		errPayload = append(errPayload, 'M')
+		errPayload = append(errPayload, "authentication failed"...)
+		errPayload = append(errPayload, 0)
+		errPayload = append(errPayload, 0)
+		writePGTestMsg(server, 'E', errPayload)
+	}()
+
+	err := tp.authenticatePG(pc)
+	if err == nil {
+		t.Fatal("expected authenticatePG to fail")
+	}
+	if err.Error() != "backend error during auth: authentication failed" {
+		t.Errorf("unexpected error: %v", err)
+	}
 }

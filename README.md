@@ -16,6 +16,7 @@ DBBouncer reduces this to a shared, managed pool per tenant.
 
 - **Multi-tenant routing** - Routes connections to the correct tenant database based on tenant ID
 - **Connection pooling** - Per-tenant pool with min/max/idle management and auto-scaling
+- **Transaction-level pooling** - Returns PostgreSQL backend connections to the pool at transaction boundaries, allowing N clients to share M connections (M << N)
 - **PostgreSQL + MySQL** - Supports both protocols from day 1
 - **REST API** - Runtime tenant CRUD, pool stats, and drain operations
 - **Health checking** - Background health checks with configurable failure thresholds
@@ -49,6 +50,7 @@ defaults:
   idle_timeout: 5m
   max_lifetime: 30m
   acquire_timeout: 10s
+  pool_mode: session         # "session" (default) or "transaction"
 
 tenants:
   tenant_1:
@@ -58,6 +60,7 @@ tenants:
     dbname: tenant_1_db
     username: app_user
     password: ${TENANT_1_PG_PASSWORD}
+    # pool_mode: transaction # Override default pool_mode per tenant
 ```
 
 ### Run
@@ -167,6 +170,50 @@ helm install dbbouncer deploy/helm/dbbouncer \
                         │  │ Health │  │   Metrics    │  │
                         │  └────────┘  └──────────────┘  │
                         └─────────────────────────────────┘
+```
+
+## Pool Modes
+
+DBBouncer supports two pool modes for PostgreSQL tenants, controlled by the `pool_mode` setting:
+
+### Session Mode (default)
+
+```yaml
+pool_mode: session
+```
+
+Each client session gets a dedicated backend connection for its entire lifetime. The connection is closed when the client disconnects. This is the safest mode and works with all PostgreSQL features.
+
+### Transaction Mode
+
+```yaml
+pool_mode: transaction
+```
+
+Backend connections are returned to the pool at transaction boundaries (when PostgreSQL reports `ReadyForQuery` with idle status). This allows N clients to share M backend connections where M << N, dramatically reducing the number of connections to the database.
+
+**How it works:**
+1. The pool pre-authenticates backend connections during startup
+2. When a client connects, it receives a synthetic auth-ok with cached server parameters
+3. A backend connection is acquired from the pool when the client sends a query
+4. After the transaction completes (COMMIT/ROLLBACK or auto-commit), `DISCARD ALL` is sent to reset session state, and the backend is returned to the pool
+5. The next query may use a different backend connection
+
+**Session pinning:** Certain operations require holding the backend for the rest of the session. DBBouncer automatically detects these and falls back to session-level behavior:
+- `LISTEN` / `NOTIFY` commands
+- Named prepared statements (extended query protocol with non-empty statement name)
+
+**Dirty disconnect handling:** If a client disconnects mid-transaction, DBBouncer sends `ROLLBACK` followed by `DISCARD ALL` to clean up the backend before returning it to the pool.
+
+**Limitations:**
+- Transaction mode is currently **PostgreSQL only**. MySQL tenants always use session mode.
+- Session-level state (SET variables, temporary tables, unnamed cursors) does not persist between transactions.
+- Applications using `LISTEN`/`NOTIFY` or named prepared statements will be pinned to a single backend (no multiplexing benefit for those sessions).
+
+**Example: 50 tenants with transaction mode**
+```
+Session mode:  50 tenants x 10 pods x 5 conns = 2,500 backend connections
+Transaction mode: 50 tenants x 20 pool conns     =  1,000 backend connections
 ```
 
 ## Testing

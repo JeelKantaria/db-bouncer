@@ -82,8 +82,20 @@ func (h *PostgresHandler) Handle(ctx context.Context, clientConn net.Conn) error
 		return fmt.Errorf("tenant %s is unhealthy", tenantID)
 	}
 
-	// Get a pooled connection
+	// Determine pool mode
+	defaults := h.router.Defaults()
+	poolMode := tc.EffectivePoolMode(defaults)
+
 	tenantPool := h.poolMgr.GetOrCreate(tenantID, tc)
+
+	if poolMode == "transaction" {
+		// Transaction-level pooling: pool has pre-authenticated connections.
+		// The startup message from the client is not forwarded — instead,
+		// the relay sends a synthetic auth-ok to the client.
+		return relayPGTransactionMode(ctx, clientConn, tenantPool, tenantID, h.metrics)
+	}
+
+	// Session-level pooling: existing behavior unchanged
 	pc, err := tenantPool.Acquire(ctx)
 	if err != nil {
 		h.sendPGError(clientConn, "FATAL", "08000", "cannot connect to database")
