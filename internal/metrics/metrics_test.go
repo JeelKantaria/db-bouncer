@@ -12,45 +12,8 @@ import (
 // so tests don't conflict with each other or with the default registry.
 func newTestCollector(t *testing.T) (*Collector, *prometheus.Registry) {
 	t.Helper()
-	reg := prometheus.NewRegistry()
-
-	c := &Collector{
-		connectionsActive: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{Name: "test_connections_active", Help: "h"},
-			[]string{"tenant", "db_type"},
-		),
-		connectionsIdle: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{Name: "test_connections_idle", Help: "h"},
-			[]string{"tenant", "db_type"},
-		),
-		connectionsTotal: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{Name: "test_connections_total", Help: "h"},
-			[]string{"tenant", "db_type"},
-		),
-		connectionsWaiting: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{Name: "test_connections_waiting", Help: "h"},
-			[]string{"tenant", "db_type"},
-		),
-		queryDuration: prometheus.NewHistogramVec(
-			prometheus.HistogramOpts{Name: "test_query_duration_seconds", Help: "h", Buckets: prometheus.DefBuckets},
-			[]string{"tenant", "db_type"},
-		),
-		tenantHealth: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{Name: "test_tenant_health", Help: "h"},
-			[]string{"tenant"},
-		),
-		poolExhausted: prometheus.NewCounterVec(
-			prometheus.CounterOpts{Name: "test_pool_exhausted_total", Help: "h"},
-			[]string{"tenant"},
-		),
-	}
-
-	reg.MustRegister(
-		c.connectionsActive, c.connectionsIdle, c.connectionsTotal,
-		c.connectionsWaiting, c.queryDuration, c.tenantHealth, c.poolExhausted,
-	)
-
-	return c, reg
+	c := New()
+	return c, c.Registry
 }
 
 func getGaugeValue(g prometheus.Gauge) float64 {
@@ -98,7 +61,7 @@ func TestQueryDuration(t *testing.T) {
 
 	var found bool
 	for _, f := range families {
-		if f.GetName() == "test_query_duration_seconds" {
+		if f.GetName() == "dbbouncer_query_duration_seconds" {
 			found = true
 			m := f.GetMetric()
 			if len(m) == 0 {
@@ -231,5 +194,97 @@ func TestNewDoesNotPanicOnMultipleCalls(t *testing.T) {
 	}
 	if v2 != 2 {
 		t.Errorf("c2 expected active=2, got %v", v2)
+	}
+}
+
+// --- Transaction-Mode Metrics Tests ---
+
+func TestTransactionCompleted(t *testing.T) {
+	c, reg := newTestCollector(t)
+
+	c.TransactionCompleted("t1", "postgres", 50*time.Millisecond)
+	c.TransactionCompleted("t1", "postgres", 100*time.Millisecond)
+
+	val := getCounterValue(c.transactionsTotal.WithLabelValues("t1", "postgres"))
+	if val != 2 {
+		t.Errorf("expected transactionsTotal=2, got %v", val)
+	}
+
+	// Check histogram
+	families, _ := reg.Gather()
+	for _, f := range families {
+		if f.GetName() == "dbbouncer_transaction_duration_seconds" {
+			m := f.GetMetric()
+			if len(m) > 0 && m[0].GetHistogram().GetSampleCount() != 2 {
+				t.Errorf("expected 2 duration samples, got %d", m[0].GetHistogram().GetSampleCount())
+			}
+		}
+	}
+}
+
+func TestAcquireDuration(t *testing.T) {
+	c, reg := newTestCollector(t)
+
+	c.AcquireDuration("t1", "postgres", 5*time.Millisecond)
+
+	families, _ := reg.Gather()
+	var found bool
+	for _, f := range families {
+		if f.GetName() == "dbbouncer_acquire_duration_seconds" {
+			found = true
+			m := f.GetMetric()
+			if len(m) > 0 && m[0].GetHistogram().GetSampleCount() != 1 {
+				t.Errorf("expected 1 acquire sample, got %d", m[0].GetHistogram().GetSampleCount())
+			}
+		}
+	}
+	if !found {
+		t.Error("acquire duration metric not found")
+	}
+}
+
+func TestSessionPinned(t *testing.T) {
+	c, _ := newTestCollector(t)
+
+	c.SessionPinned("t1", "listen command")
+	c.SessionPinned("t1", "listen command")
+	c.SessionPinned("t1", "named prepared statement")
+
+	val := getCounterValue(c.sessionPinsTotal.WithLabelValues("t1", "listen command"))
+	if val != 2 {
+		t.Errorf("expected listen pins=2, got %v", val)
+	}
+	val = getCounterValue(c.sessionPinsTotal.WithLabelValues("t1", "named prepared statement"))
+	if val != 1 {
+		t.Errorf("expected prepared stmt pins=1, got %v", val)
+	}
+}
+
+func TestBackendReset(t *testing.T) {
+	c, _ := newTestCollector(t)
+
+	c.BackendReset("t1", true)
+	c.BackendReset("t1", true)
+	c.BackendReset("t1", false)
+
+	successVal := getCounterValue(c.backendResetsTotal.WithLabelValues("t1", "success"))
+	if successVal != 2 {
+		t.Errorf("expected reset success=2, got %v", successVal)
+	}
+	failVal := getCounterValue(c.backendResetsTotal.WithLabelValues("t1", "failure"))
+	if failVal != 1 {
+		t.Errorf("expected reset failure=1, got %v", failVal)
+	}
+}
+
+func TestDirtyDisconnect(t *testing.T) {
+	c, _ := newTestCollector(t)
+
+	c.DirtyDisconnect("t1")
+	c.DirtyDisconnect("t1")
+
+	val := getCounterValue(c.dirtyDisconnects.WithLabelValues("t1"))
+	if val != 2 {
+		t.Errorf("expected dirty disconnects=2, got %v", val)
 	}
 }

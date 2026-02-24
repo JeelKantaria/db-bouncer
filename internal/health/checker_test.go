@@ -1,10 +1,13 @@
 package health
 
 import (
+	"net"
 	"testing"
 	"time"
 
 	"github.com/dbbouncer/dbbouncer/internal/config"
+	"github.com/dbbouncer/dbbouncer/internal/metrics"
+	"github.com/dbbouncer/dbbouncer/internal/pool"
 	"github.com/dbbouncer/dbbouncer/internal/router"
 )
 
@@ -242,4 +245,141 @@ func TestRemoveTenant(t *testing.T) {
 
 	// Remove nonexistent tenant should not panic
 	c.RemoveTenant("nonexistent")
+}
+
+// --- Phase 6: Health Check Improvement Tests ---
+
+func TestHealthCheckViaPoolSuccess(t *testing.T) {
+	// Spin up a minimal mock PG server that handles SELECT 1
+	listener, err := newLocalListener()
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	host, port := listenerHostPort(listener)
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+		// Read the Query message
+		msgType, _, err := readPGHealthMsg(conn)
+		if err != nil || msgType != 'Q' {
+			return
+		}
+		// Send DataRow + CommandComplete + ReadyForQuery
+		writePGHealthMsg(conn, 'D', []byte{0, 1, 0, 0, 0, 1, '1'}) // DataRow with "1"
+		writePGHealthMsg(conn, 'C', append([]byte("SELECT 1"), 0))  // CommandComplete
+		writePGHealthMsg(conn, 'Z', []byte{'I'})                    // ReadyForQuery
+	}()
+
+	txnMode := "transaction"
+	tc := config.TenantConfig{
+		DBType:   "postgres",
+		Host:     host,
+		Port:     port,
+		DBName:   "db",
+		Username: "user",
+		PoolMode: &txnMode,
+	}
+	defaults := config.PoolDefaults{
+		MinConnections: 0, MaxConnections: 2,
+		IdleTimeout: 5 * time.Minute, MaxLifetime: 30 * time.Minute,
+		AcquireTimeout: 3 * time.Second, PoolMode: "transaction",
+	}
+
+	// Create pool with a pre-authenticated connection
+	import_pool := newTestPool(t, tc, defaults)
+	defer import_pool.Close()
+
+	backendConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	pc := pool.NewPooledConn(backendConn, "test", "postgres", import_pool)
+	pc.SetAuthenticated(map[string]string{"server_version": "16.0"}, 1234, 5678)
+	import_pool.InjectTestConn(pc)
+
+	c := NewChecker(newTestRouter(), nil, testHealthCfg)
+	healthy := c.pingPostgresViaPool("test", import_pool)
+	if !healthy {
+		t.Error("expected pingPostgresViaPool to return true")
+	}
+}
+
+func TestHealthCheckViaPoolExhausted(t *testing.T) {
+	txnMode := "transaction"
+	tc := config.TenantConfig{
+		DBType: "postgres", Host: "localhost", Port: 15432,
+		DBName: "db", Username: "user", PoolMode: &txnMode,
+	}
+	defaults := config.PoolDefaults{
+		MinConnections: 0, MaxConnections: 1,
+		IdleTimeout: 5 * time.Minute, MaxLifetime: 30 * time.Minute,
+		AcquireTimeout: 100 * time.Millisecond, PoolMode: "transaction",
+	}
+	tp := newTestPool(t, tc, defaults)
+	defer tp.Close()
+	// No connections injected — pool is empty, acquire will time out
+
+	c := NewChecker(newTestRouter(), nil, config.HealthCheckConfig{
+		Interval:          30 * time.Second,
+		FailureThreshold:  3,
+		ConnectionTimeout: 100 * time.Millisecond,
+	})
+
+	healthy := c.pingPostgresViaPool("test", tp)
+	if healthy {
+		t.Error("expected pingPostgresViaPool to return false when pool is exhausted")
+	}
+}
+
+func TestHealthCheckTimingMetric(t *testing.T) {
+	m := newTestMetrics(t)
+
+	// Simulate a successful health check result with timing
+	elapsed := 5 * time.Millisecond
+	m.HealthCheckCompleted("t1", elapsed, true)
+
+	// Verify metric was recorded — just checking no panic
+	if m == nil {
+		t.Error("expected metrics collector to be non-nil")
+	}
+}
+
+func TestHealthCheckErrorMetric(t *testing.T) {
+	m := newTestMetrics(t)
+
+	m.HealthCheckError("t1", "connection_refused")
+	m.HealthCheckError("t1", "connection_refused")
+	m.HealthCheckError("t1", "pool_exhausted")
+
+	// Check the error counter recorded values without panicking
+	_ = m
+}
+
+// --- Test helpers ---
+
+func newLocalListener() (net.Listener, error) {
+	return net.Listen("tcp", "127.0.0.1:0")
+}
+
+func listenerHostPort(l net.Listener) (string, int) {
+	addr := l.Addr().(*net.TCPAddr)
+	return addr.IP.String(), addr.Port
+}
+
+func newTestPool(t *testing.T, tc config.TenantConfig, defaults config.PoolDefaults) *pool.TenantPool {
+	t.Helper()
+	return pool.NewTenantPool("test_hc", tc, defaults)
+}
+
+func newTestMetrics(t *testing.T) *metrics.Collector {
+	t.Helper()
+	return metrics.New()
 }

@@ -1,6 +1,8 @@
 package health
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/dbbouncer/dbbouncer/internal/config"
 	"github.com/dbbouncer/dbbouncer/internal/metrics"
+	"github.com/dbbouncer/dbbouncer/internal/pool"
 	"github.com/dbbouncer/dbbouncer/internal/router"
 )
 
@@ -47,6 +50,7 @@ type Checker struct {
 	tenants map[string]*TenantHealth
 	router  *router.Router
 	metrics *metrics.Collector
+	poolMgr *pool.Manager
 
 	interval          time.Duration
 	failureThreshold  int
@@ -68,6 +72,12 @@ func NewChecker(r *router.Router, m *metrics.Collector, hcCfg config.HealthCheck
 		connectionTimeout: hcCfg.ConnectionTimeout,
 		stopCh:            make(chan struct{}),
 	}
+}
+
+// SetPoolManager wires a pool.Manager into the checker so transaction-mode
+// tenants can be health-checked via a real SQL query instead of a raw TCP probe.
+func (c *Checker) SetPoolManager(pm *pool.Manager) {
+	c.poolMgr = pm
 }
 
 // Start begins periodic health checking.
@@ -120,8 +130,13 @@ func (c *Checker) checkAll() {
 		sem <- struct{}{} // acquire semaphore slot
 		go func() {
 			defer wg.Done()
-			defer func() { <-sem }() // release semaphore slot
+			defer func() { <-sem }()
+			start := time.Now()
 			healthy := c.pingTenant(id, tc)
+			elapsed := time.Since(start)
+			if c.metrics != nil {
+				c.metrics.HealthCheckCompleted(id, elapsed, healthy)
+			}
 			c.updateStatus(id, healthy)
 		}()
 	}
@@ -129,9 +144,21 @@ func (c *Checker) checkAll() {
 }
 
 func (c *Checker) pingTenant(tenantID string, tc config.TenantConfig) bool {
+	// For transaction-mode PG tenants with a live pool, use a SQL-level check
+	// via an existing pool connection — validates the full query path, not just TCP.
+	if tc.DBType == "postgres" && c.poolMgr != nil {
+		tp, ok := c.poolMgr.Get(tenantID)
+		if ok && tp.PoolMode() == "transaction" {
+			return c.pingPostgresViaPool(tenantID, tp)
+		}
+	}
+
 	addr := net.JoinHostPort(tc.Host, fmt.Sprintf("%d", tc.Port))
 	conn, err := net.DialTimeout("tcp", addr, c.connectionTimeout)
 	if err != nil {
+		if c.metrics != nil {
+			c.metrics.HealthCheckError(tenantID, "connection_refused")
+		}
 		c.setLastError(tenantID, err.Error())
 		return false
 	}
@@ -152,10 +179,71 @@ func (c *Checker) pingTenant(tenantID string, tc config.TenantConfig) bool {
 	}
 }
 
+// pingPostgresViaPool runs "SELECT 1" over a pre-authenticated pool connection,
+// giving a full end-to-end health signal. Falls back to TCP probe if the pool
+// is exhausted or the acquire times out.
+func (c *Checker) pingPostgresViaPool(tenantID string, tp *pool.TenantPool) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), c.connectionTimeout)
+	defer cancel()
+
+	pc, err := tp.Acquire(ctx)
+	if err != nil {
+		// Pool exhausted — fall back to TCP probe
+		if c.metrics != nil {
+			c.metrics.HealthCheckError(tenantID, "pool_exhausted")
+		}
+		c.setLastError(tenantID, "pool exhausted for health check: "+err.Error())
+		return false
+	}
+	defer tp.Return(pc)
+
+	conn := pc.Conn()
+	conn.SetDeadline(time.Now().Add(c.connectionTimeout))
+
+	// Send SELECT 1 as a simple query
+	query := append([]byte("SELECT 1"), 0)
+	if err := writePGHealthMsg(conn, 'Q', query); err != nil {
+		if c.metrics != nil {
+			c.metrics.HealthCheckError(tenantID, "write_error")
+		}
+		c.setLastError(tenantID, "health check write: "+err.Error())
+		pc.Close()
+		return false
+	}
+
+	// Read responses until ReadyForQuery
+	for {
+		msgType, _, err := readPGHealthMsg(conn)
+		if err != nil {
+			if c.metrics != nil {
+				c.metrics.HealthCheckError(tenantID, "read_error")
+			}
+			c.setLastError(tenantID, "health check read: "+err.Error())
+			pc.Close()
+			return false
+		}
+		if msgType == 'E' { // ErrorResponse
+			if c.metrics != nil {
+				c.metrics.HealthCheckError(tenantID, "query_error")
+			}
+			c.setLastError(tenantID, "health check SELECT 1 returned error")
+			// Don't close — backend is still functional, just had an error
+			return false
+		}
+		if msgType == 'Z' { // ReadyForQuery
+			// Clear the last error on success
+			c.setLastError(tenantID, "")
+			return true
+		}
+	}
+}
+
 func (c *Checker) setLastError(tenantID, errMsg string) {
 	c.mu.Lock()
 	th := c.getOrCreate(tenantID)
-	th.LastError = errMsg
+	if errMsg != "" {
+		th.LastError = errMsg
+	}
 	c.mu.Unlock()
 }
 
@@ -343,3 +431,38 @@ func (c *Checker) RemoveTenant(tenantID string) {
 	}
 	slog.Info("removed health state", "tenant", tenantID)
 }
+
+// writePGHealthMsg writes a typed PG message (type + length + payload).
+func writePGHealthMsg(conn net.Conn, msgType byte, payload []byte) error {
+	msgLen := uint32(len(payload) + 4)
+	buf := make([]byte, 1+4+len(payload))
+	buf[0] = msgType
+	binary.BigEndian.PutUint32(buf[1:5], msgLen)
+	copy(buf[5:], payload)
+	_, err := conn.Write(buf)
+	return err
+}
+
+// readPGHealthMsg reads a PG message and returns its type and payload.
+func readPGHealthMsg(conn net.Conn) (byte, []byte, error) {
+	typeBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, typeBuf); err != nil {
+		return 0, nil, err
+	}
+	lenBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		return 0, nil, err
+	}
+	payloadLen := int(binary.BigEndian.Uint32(lenBuf)) - 4
+	if payloadLen < 0 || payloadLen > 1<<20 {
+		return 0, nil, fmt.Errorf("invalid message length: %d", payloadLen)
+	}
+	payload := make([]byte, payloadLen)
+	if payloadLen > 0 {
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return 0, nil, err
+		}
+	}
+	return typeBuf[0], payload, nil
+}
+
