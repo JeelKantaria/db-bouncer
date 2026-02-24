@@ -373,3 +373,30 @@ func TestHMACSHA256(t *testing.T) {
 		}
 	}
 }
+
+// --- MySQL native password hash tests ---
+
+func TestMySQLNativePasswordHash(t *testing.T) {
+	challenge := make([]byte, 20)
+	for i := range challenge {
+		challenge[i] = 0x01
+	}
+	result := mysqlNativePasswordHash([]byte("password"), challenge)
+	if len(result) != 20 {
+		t.Fatalf("expected 20 bytes, got %d", len(result))
+	}
+	// Determinism check
+	result2 := mysqlNativePasswordHash([]byte("password"), challenge)
+	for i := range result {
+		if result[i] != result2[i] {
+			t.Error("hash is not deterministic")
+		}
+	}
+}
+
+func TestMySQLNativePasswordEmpty(t *testing.T) {
+	result := mysqlNativePasswordHash([]byte(""), []byte("challenge"))
+	if len(result) != 0 {
+		t.Errorf("expected empty hash for empty password, got %v", result)
+	}
+}
