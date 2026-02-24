@@ -97,8 +97,18 @@ func (h *MySQLHandler) Handle(ctx context.Context, clientConn net.Conn) error {
 		return fmt.Errorf("tenant %s is unhealthy", tenantID)
 	}
 
-	// Get a pooled raw TCP connection to the backend
 	tenantPool := h.poolMgr.GetOrCreate(tenantID, tc)
+	defaults := h.router.Defaults()
+	poolMode := tc.EffectivePoolMode(defaults)
+
+	// Transaction-level pooling: pool has pre-authenticated connections; we
+	// handle the entire session in the relay function.
+	if poolMode == "transaction" {
+		return relayMySQLTransactionMode(ctx, clientConn, tenantPool, tenantID, h.metrics)
+	}
+
+	// Session-level pooling: acquire a raw TCP connection and do the full
+	// MySQL handshake dance (existing behavior, unchanged).
 	pc, err := tenantPool.Acquire(ctx)
 	if err != nil {
 		h.sendMySQLError(clientConn, 1045, "08S01", "cannot connect to database", errSeq)

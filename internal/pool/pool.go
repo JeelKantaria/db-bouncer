@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha1" //nolint:gosec // MySQL native_password uses SHA-1 by spec
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -389,6 +390,14 @@ func (tp *TenantPool) dial(ctx context.Context) (*PooledConn, error) {
 		}
 	}
 
+	// For transaction-mode MySQL pools, authenticate during dial
+	if tp.poolMode == "transaction" && tp.dbType == "mysql" {
+		if err := tp.authenticateMySQL(pc); err != nil {
+			pc.Close()
+			return nil, fmt.Errorf("MySQL auth during dial: %w", err)
+		}
+	}
+
 	return pc, nil
 }
 
@@ -586,6 +595,278 @@ func computeMD5Password(user, password string, salt []byte) string {
 	hex1 := hex.EncodeToString(h1[:])
 	h2 := md5.Sum(append([]byte(hex1), salt...))
 	return "md5" + hex.EncodeToString(h2[:])
+}
+
+// authenticateMySQL performs the MySQL connection phase (Protocol::Handshake v10)
+// on a raw connection, producing a ready-to-query connection. It handles
+// mysql_native_password (SHA-1 based) auth, which is the most common method.
+// On success the PooledConn is marked authenticated.
+func (tp *TenantPool) authenticateMySQL(pc *PooledConn) error {
+	conn := pc.Conn()
+
+	// --- Step 1: Read server's Initial Handshake Packet ---
+	pkt, _, err := readMySQLPoolPacket(conn)
+	if err != nil {
+		return fmt.Errorf("reading server handshake: %w", err)
+	}
+	if len(pkt) < 1 {
+		return fmt.Errorf("empty server handshake")
+	}
+	if pkt[0] == 0xff { // ERR_Packet
+		return fmt.Errorf("server sent error on connect")
+	}
+
+	// Parse Protocol::HandshakeV10
+	// Format: protocol_version(1) + server_version(null-term) + conn_id(4) +
+	//         auth_plugin_data_1(8) + filler(1) + capability_flags_1(2) +
+	//         character_set(1) + status_flags(2) + capability_flags_2(2) +
+	//         auth_plugin_data_len(1) + reserved(10) + auth_plugin_data_2(max(13, len-8)) +
+	//         auth_plugin_name(null-term, if CLIENT_PLUGIN_AUTH)
+	pos := 1 // skip protocol version byte
+	// skip server version (null-terminated)
+	for pos < len(pkt) && pkt[pos] != 0 {
+		pos++
+	}
+	pos++ // skip null terminator
+	if pos+4 > len(pkt) {
+		return fmt.Errorf("handshake packet too short")
+	}
+	pos += 4 // skip connection_id
+
+	// auth-plugin-data part 1 (8 bytes)
+	if pos+8 > len(pkt) {
+		return fmt.Errorf("handshake packet too short for auth data 1")
+	}
+	authData := make([]byte, 0, 20)
+	authData = append(authData, pkt[pos:pos+8]...)
+	pos += 8
+	pos++ // filler
+
+	// capability flags (lower 2 bytes)
+	if pos+2 > len(pkt) {
+		return fmt.Errorf("handshake packet too short for capability flags")
+	}
+	capLow := uint32(binary.LittleEndian.Uint16(pkt[pos : pos+2]))
+	pos += 2
+
+	// character set + status flags
+	if pos+3 > len(pkt) {
+		return fmt.Errorf("handshake packet too short for charset/status")
+	}
+	pos += 3 // charset(1) + status_flags(2)
+
+	// capability flags (upper 2 bytes)
+	if pos+2 > len(pkt) {
+		return fmt.Errorf("handshake packet too short for capability flags high")
+	}
+	capHigh := uint32(binary.LittleEndian.Uint16(pkt[pos:pos+2])) << 16
+	capFlags := capLow | capHigh
+	pos += 2
+
+	// auth_plugin_data_len
+	var authPluginDataLen int
+	if pos < len(pkt) {
+		authPluginDataLen = int(pkt[pos])
+		pos++
+	}
+	pos += 10 // reserved
+
+	// auth-plugin-data part 2: max(13, auth_plugin_data_len - 8) bytes
+	part2Len := authPluginDataLen - 8
+	if part2Len < 13 {
+		part2Len = 13
+	}
+	if pos+part2Len > len(pkt) {
+		part2Len = len(pkt) - pos
+	}
+	if part2Len > 0 {
+		// trim trailing null byte
+		part2 := pkt[pos : pos+part2Len]
+		if len(part2) > 0 && part2[len(part2)-1] == 0 {
+			part2 = part2[:len(part2)-1]
+		}
+		authData = append(authData, part2...)
+	}
+	pos += part2Len
+
+	// auth plugin name (null-terminated), if CLIENT_PLUGIN_AUTH (bit 19) set
+	const clientPluginAuth = uint32(1 << 19)
+	pluginName := "mysql_native_password"
+	if capFlags&clientPluginAuth != 0 && pos < len(pkt) {
+		end := pos
+		for end < len(pkt) && pkt[end] != 0 {
+			end++
+		}
+		pluginName = string(pkt[pos:end])
+	}
+
+	// --- Step 2: Send HandshakeResponse41 ---
+	// Capability flags we claim:
+	// CLIENT_LONG_PASSWORD(1) | CLIENT_PROTOCOL_41(512) | CLIENT_SECURE_CONNECTION(32768) |
+	// CLIENT_PLUGIN_AUTH(1<<19) | CLIENT_CONNECT_WITH_DB(8)
+	const (
+		clientLongPassword     = uint32(1)
+		clientConnectWithDB    = uint32(8)
+		clientProtocol41       = uint32(512)
+		clientSecureConnection = uint32(32768)
+	)
+	clientCaps := clientLongPassword | clientProtocol41 | clientSecureConnection | clientPluginAuth | clientConnectWithDB
+
+	// Compute auth response based on plugin
+	var authResp []byte
+	switch pluginName {
+	case "mysql_native_password":
+		authResp = mysqlNativePasswordHash([]byte(tp.password), authData)
+	default:
+		// Fallback: send empty auth, server may switch plugin
+		authResp = []byte{}
+	}
+
+	// Build HandshakeResponse41:
+	// capability_flags(4) + max_packet_size(4) + character_set(1) + reserved(23) +
+	// username(null-term) + auth_response_length(1) + auth_response +
+	// database(null-term) + auth_plugin_name(null-term)
+	var resp []byte
+	capBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(capBuf, clientCaps)
+	resp = append(resp, capBuf...)
+	resp = append(resp, 0xff, 0xff, 0xff, 0x00) // max_packet_size
+	resp = append(resp, 0x21)                    // utf8_general_ci
+	resp = append(resp, make([]byte, 23)...)     // reserved
+	resp = append(resp, []byte(tp.username)...)
+	resp = append(resp, 0) // null terminator
+	resp = append(resp, byte(len(authResp)))
+	resp = append(resp, authResp...)
+	resp = append(resp, []byte(tp.dbname)...)
+	resp = append(resp, 0)
+	resp = append(resp, []byte("mysql_native_password")...)
+	resp = append(resp, 0)
+
+	if err := writeMySQLPoolPacket(conn, resp, 1); err != nil {
+		return fmt.Errorf("sending handshake response: %w", err)
+	}
+
+	// --- Step 3: Read auth result ---
+	pkt, _, err = readMySQLPoolPacket(conn)
+	if err != nil {
+		return fmt.Errorf("reading auth result: %w", err)
+	}
+	if len(pkt) < 1 {
+		return fmt.Errorf("empty auth result")
+	}
+
+	switch pkt[0] {
+	case 0x00: // OK_Packet
+		pc.SetAuthenticated(nil, 0, 0)
+		return nil
+	case 0xfe: // AuthSwitchRequest — server wants a different plugin
+		if len(pkt) < 2 {
+			return fmt.Errorf("malformed AuthSwitchRequest")
+		}
+		// Parse: plugin_name(null-term) + plugin_data
+		nameEnd := 1
+		for nameEnd < len(pkt) && pkt[nameEnd] != 0 {
+			nameEnd++
+		}
+		switchPlugin := string(pkt[1:nameEnd])
+		var switchData []byte
+		if nameEnd+1 < len(pkt) {
+			switchData = pkt[nameEnd+1:]
+			if len(switchData) > 0 && switchData[len(switchData)-1] == 0 {
+				switchData = switchData[:len(switchData)-1]
+			}
+		}
+		// Compute response for switched plugin
+		var switchResp []byte
+		switch switchPlugin {
+		case "mysql_native_password":
+			switchResp = mysqlNativePasswordHash([]byte(tp.password), switchData)
+		default:
+			return fmt.Errorf("unsupported auth plugin switch: %s", switchPlugin)
+		}
+		if err := writeMySQLPoolPacket(conn, switchResp, 3); err != nil {
+			return fmt.Errorf("sending auth switch response: %w", err)
+		}
+		// Read final result
+		pkt, _, err = readMySQLPoolPacket(conn)
+		if err != nil {
+			return fmt.Errorf("reading auth switch result: %w", err)
+		}
+		if len(pkt) < 1 || pkt[0] != 0x00 {
+			return fmt.Errorf("MySQL auth failed after plugin switch")
+		}
+		pc.SetAuthenticated(nil, 0, 0)
+		return nil
+	case 0xff: // ERR_Packet
+		msg := parseMySQLError(pkt)
+		return fmt.Errorf("MySQL auth failed: %s", msg)
+	default:
+		return fmt.Errorf("unexpected auth response byte: 0x%02x", pkt[0])
+	}
+}
+
+// mysqlNativePasswordHash computes the mysql_native_password hash:
+// SHA1(password) XOR SHA1(authData + SHA1(SHA1(password)))
+func mysqlNativePasswordHash(password, authData []byte) []byte {
+	if len(password) == 0 {
+		return []byte{}
+	}
+	// SHA1(password)
+	h1 := sha1.Sum(password) //nolint:gosec
+	// SHA1(SHA1(password))
+	h2 := sha1.Sum(h1[:]) //nolint:gosec
+	// SHA1(authData + SHA1(SHA1(password)))
+	h := sha1.New() //nolint:gosec
+	h.Write(authData)
+	h.Write(h2[:])
+	h3 := h.Sum(nil)
+	// XOR h1 with h3
+	result := make([]byte, 20)
+	for i := range result {
+		result[i] = h1[i] ^ h3[i]
+	}
+	return result
+}
+
+// readMySQLPoolPacket reads one MySQL packet: 3-byte length + 1-byte seq + payload.
+func readMySQLPoolPacket(conn net.Conn) (payload []byte, seq byte, err error) {
+	hdr := make([]byte, 4)
+	if _, err = io.ReadFull(conn, hdr); err != nil {
+		return nil, 0, err
+	}
+	length := int(hdr[0]) | int(hdr[1])<<8 | int(hdr[2])<<16
+	seq = hdr[3]
+	if length == 0 {
+		return []byte{}, seq, nil
+	}
+	payload = make([]byte, length)
+	if _, err = io.ReadFull(conn, payload); err != nil {
+		return nil, seq, err
+	}
+	return payload, seq, nil
+}
+
+// writeMySQLPoolPacket writes one MySQL packet with the given sequence number.
+func writeMySQLPoolPacket(conn net.Conn, payload []byte, seq byte) error {
+	hdr := make([]byte, 4)
+	length := len(payload)
+	hdr[0] = byte(length)
+	hdr[1] = byte(length >> 8)
+	hdr[2] = byte(length >> 16)
+	hdr[3] = seq
+	buf := append(hdr, payload...)
+	_, err := conn.Write(buf)
+	return err
+}
+
+// parseMySQLError extracts the error message from an ERR_Packet.
+// Format: 0xff(1) + error_code(2) + '#'(1) + sqlstate(5) + message
+func parseMySQLError(pkt []byte) string {
+	if len(pkt) < 9 {
+		return "unknown error"
+	}
+	// skip 0xff(1) + code(2) + '#'(1) + sqlstate(5)
+	return string(pkt[9:])
 }
 
 func (tp *TenantPool) reapLoop() {
