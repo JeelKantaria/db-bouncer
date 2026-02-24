@@ -491,6 +491,10 @@ func (tp *TenantPool) authenticatePG(pc *PooledConn) error {
 				if err := tp.sendPasswordMessage(conn, md5Pass); err != nil {
 					return err
 				}
+			case 10: // AuthenticationSASL (SCRAM-SHA-256)
+				if err := scramSHA256Auth(conn, tp.username, tp.password, payload); err != nil {
+					return fmt.Errorf("SCRAM-SHA-256 auth: %w", err)
+				}
 			default:
 				return fmt.Errorf("unsupported auth type: %d", authType)
 			}

@@ -49,6 +49,9 @@ func main() {
 		m.UpdatePoolStats(s.TenantID, s.DBType, s.Active, s.Idle, s.Total, s.Waiting)
 	})
 
+	// Wire pool manager into health checker for SQL-level health checks
+	hc.SetPoolManager(pm)
+
 	// Start health checker
 	hc.Start()
 

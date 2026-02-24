@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/dbbouncer/dbbouncer/internal/metrics"
 	"github.com/dbbouncer/dbbouncer/internal/pool"
@@ -25,9 +26,13 @@ func relayPGTransactionMode(ctx context.Context, client net.Conn,
 	m *metrics.Collector) error {
 
 	// Acquire initial backend connection
+	acquireStart := time.Now()
 	pc, err := tenantPool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquiring initial backend: %w", err)
+	}
+	if m != nil {
+		m.AcquireDuration(tenantID, "postgres", time.Since(acquireStart))
 	}
 
 	// Send synthetic auth-ok to client
@@ -41,13 +46,14 @@ func relayPGTransactionMode(ctx context.Context, client net.Conn,
 	pc = nil
 	var backend net.Conn
 
-	pinned := false // session pinning flag
+	pinned := false           // session pinning flag
+	var txnStart time.Time    // when the current backend was acquired
 
 	for {
 		select {
 		case <-ctx.Done():
 			if pc != nil {
-				cleanupBackend(pc, tenantPool)
+				cleanupBackend(pc, tenantPool, tenantID, m)
 			}
 			return ctx.Err()
 		default:
@@ -59,7 +65,7 @@ func relayPGTransactionMode(ctx context.Context, client net.Conn,
 			// Client disconnected
 			if pc != nil {
 				// Mid-transaction disconnect — rollback and cleanup
-				cleanupBackend(pc, tenantPool)
+				cleanupBackend(pc, tenantPool, tenantID, m)
 			}
 			return nil // client disconnect is not an error
 		}
@@ -67,18 +73,23 @@ func relayPGTransactionMode(ctx context.Context, client net.Conn,
 		// Handle Terminate ('X') — clean shutdown
 		if msgType == pgMsgTerminate {
 			if pc != nil {
-				resetAndReturn(pc, tenantPool)
+				resetAndReturn(pc, tenantPool, tenantID, m)
 			}
 			return nil
 		}
 
 		// If no backend held, re-acquire one
 		if pc == nil {
+			acquireStart = time.Now()
 			pc, err = tenantPool.Acquire(ctx)
 			if err != nil {
 				sendPGErrorToConn(client, "FATAL", "08000", "cannot acquire backend connection")
 				return fmt.Errorf("re-acquiring backend: %w", err)
 			}
+			if m != nil {
+				m.AcquireDuration(tenantID, "postgres", time.Since(acquireStart))
+			}
+			txnStart = time.Now()
 			backend = pc.Conn()
 		} else {
 			backend = pc.Conn()
@@ -88,7 +99,11 @@ func relayPGTransactionMode(ctx context.Context, client net.Conn,
 		if !pinned {
 			pinned = detectSessionPin(msgType, payload)
 			if pinned {
-				slog.Info("session pinned", "tenant", tenantID, "reason", pinReason(msgType, payload))
+				reason := pinReason(msgType, payload)
+				slog.Info("session pinned", "tenant", tenantID, "reason", reason)
+				if m != nil {
+					m.SessionPinned(tenantID, reason)
+				}
 			}
 		}
 
@@ -111,7 +126,7 @@ func relayPGTransactionMode(ctx context.Context, client net.Conn,
 			// Forward to client
 			if err := writePGMessage(client, rType, rPayload); err != nil {
 				// Client gone, cleanup backend
-				cleanupBackend(pc, tenantPool)
+				cleanupBackend(pc, tenantPool, tenantID, m)
 				pc = nil
 				return nil
 			}
@@ -121,9 +136,13 @@ func relayPGTransactionMode(ctx context.Context, client net.Conn,
 					txnStatus := rPayload[0]
 					if txnStatus == 'I' && !pinned {
 						// Transaction boundary — release backend to pool
-						resetAndReturn(pc, tenantPool)
+						if m != nil && !txnStart.IsZero() {
+							m.TransactionCompleted(tenantID, "postgres", time.Since(txnStart))
+						}
+						resetAndReturn(pc, tenantPool, tenantID, m)
 						pc = nil
 						backend = nil
+						txnStart = time.Time{}
 					}
 					// 'T' (in transaction) or 'E' (error) — keep holding
 				}
@@ -173,7 +192,7 @@ func sendSyntheticAuthOK(client net.Conn, pc *pool.PooledConn) error {
 
 // resetAndReturn sends DISCARD ALL to the backend before returning it to the pool.
 // If the reset fails, the connection is closed instead of returned.
-func resetAndReturn(pc *pool.PooledConn, tenantPool *pool.TenantPool) {
+func resetAndReturn(pc *pool.PooledConn, tenantPool *pool.TenantPool, tenantID string, m *metrics.Collector) {
 	conn := pc.Conn()
 
 	// Send "DISCARD ALL;\0" as a simple query
@@ -181,6 +200,9 @@ func resetAndReturn(pc *pool.PooledConn, tenantPool *pool.TenantPool) {
 	payload := append([]byte(query), 0)
 	if err := writePGMessage(conn, pgMsgQuery, payload); err != nil {
 		slog.Debug("reset failed, closing connection", "err", err)
+		if m != nil {
+			m.BackendReset(tenantID, false)
+		}
 		pc.Close()
 		return
 	}
@@ -190,21 +212,33 @@ func resetAndReturn(pc *pool.PooledConn, tenantPool *pool.TenantPool) {
 		rType, rPayload, err := readPGMessage(conn)
 		if err != nil {
 			slog.Debug("reset read failed, closing connection", "err", err)
+			if m != nil {
+				m.BackendReset(tenantID, false)
+			}
 			pc.Close()
 			return
 		}
 		if rType == pgMsgReadyForQuery {
 			if len(rPayload) >= 1 && rPayload[0] == 'I' {
+				if m != nil {
+					m.BackendReset(tenantID, true)
+				}
 				pc.Return()
 				return
 			}
 			// Unexpected state after DISCARD ALL
 			slog.Debug("unexpected state after DISCARD ALL, closing", "status", string(rPayload))
+			if m != nil {
+				m.BackendReset(tenantID, false)
+			}
 			pc.Close()
 			return
 		}
 		if rType == pgMsgErrorResponse {
 			slog.Debug("DISCARD ALL returned error, closing connection")
+			if m != nil {
+				m.BackendReset(tenantID, false)
+			}
 			pc.Close()
 			return
 		}
@@ -214,7 +248,11 @@ func resetAndReturn(pc *pool.PooledConn, tenantPool *pool.TenantPool) {
 
 // cleanupBackend handles a dirty disconnect — sends ROLLBACK + DISCARD ALL
 // before closing the connection.
-func cleanupBackend(pc *pool.PooledConn, tenantPool *pool.TenantPool) {
+func cleanupBackend(pc *pool.PooledConn, tenantPool *pool.TenantPool, tenantID string, m *metrics.Collector) {
+	if m != nil {
+		m.DirtyDisconnect(tenantID)
+	}
+
 	conn := pc.Conn()
 
 	// Try to send ROLLBACK
@@ -237,7 +275,7 @@ func cleanupBackend(pc *pool.PooledConn, tenantPool *pool.TenantPool) {
 	}
 
 	// Now try DISCARD ALL and return
-	resetAndReturn(pc, tenantPool)
+	resetAndReturn(pc, tenantPool, tenantID, m)
 }
 
 // detectSessionPin checks if a message requires session pinning.
